@@ -4,22 +4,18 @@ export class Gun extends Phaser.GameObjects.Container {
     private gunBody: Phaser.GameObjects.Rectangle;
     private barrel: Phaser.GameObjects.Rectangle;
 
-    constructor(
-        scene: Phaser.Scene,
-        x: number,
-        y: number
-    ) {
-        super(scene, x, y);;
+    constructor(scene: Phaser.Scene, x: number, y: number) {
+        super(scene, x, y);
 
         scene.add.existing(this);
 
-        //Gun base
+        // Main gun body
         this.gunBody = scene.add.rectangle(
             0,
             0,
-            42,
-            42,
-            0x3a3a3a
+            32,
+            24,
+            0x4a4a4a
         );
 
         this.gunBody.setStrokeStyle(
@@ -27,12 +23,17 @@ export class Gun extends Phaser.GameObjects.Container {
             0x888888
         );
 
-        // Gun barrel
+        // Barrel pointing upward
         this.barrel = scene.add.rectangle(
             0,
-            -20,
+            -18,
             8,
-            28,
+            18,
+            0x777777
+        );
+
+        this.barrel.setStrokeStyle(
+            1,
             0xaaaaaa
         );
 
