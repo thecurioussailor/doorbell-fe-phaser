@@ -1,8 +1,6 @@
 import Phaser from "phaser";
 
 export class Player extends Phaser.Physics.Arcade.Sprite {
-    private speed = 200;
-
     private cursors: Phaser.Types.Input.Keyboard.CursorKeys;
 
     private wasd: {
@@ -11,6 +9,11 @@ export class Player extends Phaser.Physics.Arcade.Sprite {
         S: Phaser.Input.Keyboard.Key;
         D: Phaser.Input.Keyboard.Key;
     };
+
+    // -1, 0, or 1 on each axis. Read by GameScene and sent to the server as
+    // MoveInput — the server is authoritative, so this is intent, not motion.
+    private moveX = 0;
+    private moveY = 0;
 
     constructor(scene: Phaser.Scene, x: number, y: number) {
         super(scene, x, y, "player");
@@ -32,23 +35,37 @@ export class Player extends Phaser.Physics.Arcade.Sprite {
     }
 
     update() {
-        const body = this.body as Phaser.Physics.Arcade.Body;
-
-        body.setVelocity(0);
+        let moveX = 0;
+        let moveY = 0;
 
         if (this.cursors.left.isDown || this.wasd.A.isDown) {
-            body.setVelocityX(-this.speed);
+            moveX -= 1;
         }
         if (this.cursors.right.isDown || this.wasd.D.isDown) {
-            body.setVelocityX(this.speed);
-        }
-        if (this.cursors.down.isDown || this.wasd.S.isDown) {
-            body.setVelocityY(this.speed);
+            moveX += 1;
         }
         if (this.cursors.up.isDown || this.wasd.W.isDown) {
-            body.setVelocityY(-this.speed);
+            moveY -= 1;
+        }
+        if (this.cursors.down.isDown || this.wasd.S.isDown) {
+            moveY += 1;
         }
 
-       body.velocity.normalize().scale(this.speed);
+        this.moveX = moveX;
+        this.moveY = moveY;
+    }
+
+    getInput(): { moveX: number; moveY: number } {
+        return { moveX: this.moveX, moveY: this.moveY };
+    }
+
+    // The server is authoritative over position — this snaps both the body
+    // and the game object to it. `body.reset()` (not `setPosition()`) because
+    // Arcade Physics writes the body's own tracked position back onto the
+    // game object every step; setPosition() alone would get overwritten on
+    // the next physics tick.
+    applyServerPosition(x: number, y: number) {
+        const body = this.body as Phaser.Physics.Arcade.Body;
+        body.reset(x, y);
     }
 }

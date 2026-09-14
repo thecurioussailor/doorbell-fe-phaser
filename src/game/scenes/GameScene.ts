@@ -1,5 +1,5 @@
 import Phaser from "phaser";
-import { getStateCallbacks } from "@colyseus/sdk";
+import { getStateCallbacks, type InputHandle } from "@colyseus/sdk";
 import { Player } from "../entities/Player";
 import { RemotePlayer } from "../entities/RemotePlayer";
 import { Bed } from "../entities/Bed";
@@ -11,6 +11,7 @@ export class GameScene extends Phaser.Scene {
 
     private gameClient!: GameClient;
     private remotePlayers = new Map<string, RemotePlayer>();
+    private moveInput?: InputHandle<{ moveX: number; moveY: number }>;
     private walls!: Phaser.Physics.Arcade.StaticGroup;
     private player!: Player;
     private bed!: Bed;
@@ -52,13 +53,25 @@ export class GameScene extends Phaser.Scene {
                 console.log("Doorbell connected!");
                 console.log("My session:", room.sessionId);
 
+                // The server already knows MoveInput's shape (MyRoom calls
+                // defineInput(MoveInput)) and sends it during the join
+                // handshake, so no schema import is needed on this side.
+                this.moveInput = room.input();
+
                 const $ = getStateCallbacks(room);
 
                 $(room.state).players.onAdd((remotePlayerState, sessionId) => {
-                    // The server also creates a state entry for us — the
-                    // local player is already represented by the
-                    // keyboard-controlled `Player` instance, so skip it.
+                    // The server also creates a state entry for us. The local
+                    // player is already represented by the keyboard-reading
+                    // `Player` instance — just keep its position in sync with
+                    // the authoritative state instead of spawning a RemotePlayer.
                     if (sessionId === room.sessionId) {
+                        $(remotePlayerState).onChange(() => {
+                            this.player.applyServerPosition(
+                                remotePlayerState.x,
+                                remotePlayerState.y
+                            );
+                        });
                         return;
                     }
 
@@ -69,6 +82,13 @@ export class GameScene extends Phaser.Scene {
                     );
 
                     this.remotePlayers.set(sessionId, remotePlayer);
+
+                    $(remotePlayerState).onChange(() => {
+                        remotePlayer.setPosition(
+                            remotePlayerState.x,
+                            remotePlayerState.y
+                        );
+                    });
                 });
 
                 $(room.state).players.onRemove((_remotePlayerState, sessionId) => {
@@ -209,8 +229,20 @@ export class GameScene extends Phaser.Scene {
             return;
         }
 
-        // Player is awake, so movement works normally.
+        // Player is awake: read keyboard intent and send it to the server.
+        // The server is authoritative — this does not move the sprite
+        // locally; the reactive onChange handler above does that once the
+        // resulting state patch comes back.
         this.player.update();
+
+        if (this.moveInput) {
+            const { moveX, moveY } = this.player.getInput();
+
+            this.moveInput.data.moveX = moveX;
+            this.moveInput.data.moveY = moveY;
+
+            this.moveInput.send();
+        }
 
         const nearDoor = this.isPlayerNearDoor();
 
