@@ -4,6 +4,13 @@ export class Gun extends Phaser.GameObjects.Container {
     private gunBody: Phaser.GameObjects.Rectangle;
     private barrel: Phaser.GameObjects.Rectangle;
 
+    // Combat properties
+    public readonly range = 180;
+    public readonly damage = 10;
+    public readonly fireRate = 1000;
+
+    private lastFiredAt = 0;
+
     constructor(scene: Phaser.Scene, x: number, y: number) {
         super(scene, x, y);
 
@@ -41,5 +48,17 @@ export class Gun extends Phaser.GameObjects.Container {
             this.gunBody,
             this.barrel,
         ]);
+    }
+
+    public canFire(time: number): boolean {
+        return time - this.lastFiredAt >= this.fireRate;
+    }
+
+    public fire(time: number): void {
+        if (!this.canFire(time)) {
+            return;
+        }
+
+        this.lastFiredAt = time;
     }
 }

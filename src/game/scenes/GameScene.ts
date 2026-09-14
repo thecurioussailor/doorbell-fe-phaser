@@ -1,10 +1,16 @@
 import Phaser from "phaser";
+import { getStateCallbacks } from "@colyseus/sdk";
 import { Player } from "../entities/Player";
+import { RemotePlayer } from "../entities/RemotePlayer";
 import { Bed } from "../entities/Bed";
 import { BuildTile } from "../entities/BuildTile";
 import { Gun } from "../entities/Gun";
+import { GameClient } from "../network/GameClient";
 
 export class GameScene extends Phaser.Scene {
+
+    private gameClient!: GameClient;
+    private remotePlayers = new Map<string, RemotePlayer>();
     private walls!: Phaser.Physics.Arcade.StaticGroup;
     private player!: Player;
     private bed!: Bed;
@@ -38,6 +44,42 @@ export class GameScene extends Phaser.Scene {
     }
 
     create() {
+
+        this.gameClient = new GameClient();
+
+        this.gameClient.connect()
+            .then((room) => {
+                console.log("Doorbell connected!");
+                console.log("My session:", room.sessionId);
+
+                const $ = getStateCallbacks(room);
+
+                $(room.state).players.onAdd((remotePlayerState, sessionId) => {
+                    // The server also creates a state entry for us — the
+                    // local player is already represented by the
+                    // keyboard-controlled `Player` instance, so skip it.
+                    if (sessionId === room.sessionId) {
+                        return;
+                    }
+
+                    const remotePlayer = new RemotePlayer(
+                        this,
+                        remotePlayerState.x,
+                        remotePlayerState.y
+                    );
+
+                    this.remotePlayers.set(sessionId, remotePlayer);
+                });
+
+                $(room.state).players.onRemove((_remotePlayerState, sessionId) => {
+                    this.remotePlayers.get(sessionId)?.destroy();
+                    this.remotePlayers.delete(sessionId);
+                });
+            })
+            .catch((error) => {
+                console.error("Could not connect to Colyseus:", error);
+            });
+
         this.walls = this.physics.add.staticGroup();
         
         this.createPlayerTexture();
