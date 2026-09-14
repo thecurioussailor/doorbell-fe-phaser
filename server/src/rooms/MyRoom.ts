@@ -1,11 +1,16 @@
 import { Room, Client, CloseCode, type StepContext } from "colyseus";
 import { MyRoomState, Player, MoveInput } from "./schema/MyRoomState.js";
 import { stepEntity } from "../shared/movement.js";
-import { TICK_RATE, ARENA_WIDTH, ARENA_HEIGHT } from "../shared/constants.js";
+import {
+  TICK_RATE, SPAWN_TILES, getSpawnPixel,
+  ROOM_POSITIONS, getRoomDoorPixel, DOOR_INTERACT_RADIUS,
+} from "../shared/constants.js";
 
 export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
-  maxClients = 8;
-  state = new MyRoomState();
+  // Milestone 5: the room is sized for exactly the 4 players the arena
+  // has deterministic spawn slots for.
+  maxClients = 4;
+  state = new MyRoomState({ doorOpen: false });
 
   /**
    * Per-client input buffer. `sanitize` clamps every field as it is decoded —
@@ -22,6 +27,29 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
   messages = {
     // movement arrives through the input buffer above — register handlers here
     // only for things that are not inputs (chat, emotes, …).
+
+    /**
+     * The client only ever REQUESTS a toggle — it never sets doorOpen
+     * itself. Validated here against the requesting player's own
+     * authoritative server-side position (never a client-supplied one).
+     * There is one shared doorOpen state, reachable from any of the four
+     * rooms' doors — standing near ANY of them and pressing E toggles the
+     * same state for all four. (Four independent door states is deferred
+     * — that's room-specific gameplay, out of scope for this milestone.)
+     */
+    toggleDoor: (client: Client) => {
+      const player = this.state.players.get(client.sessionId);
+      if (!player) { return; }
+
+      const isNearAnyDoor = ROOM_POSITIONS.some((room) => {
+        const door = getRoomDoorPixel(room);
+        return Math.hypot(player.x - door.x, player.y - door.y) <= DOOR_INTERACT_RADIUS;
+      });
+
+      if (!isNearAnyDoor) { return; }
+
+      this.state.doorOpen = !this.state.doorOpen;
+    },
   };
 
   onCreate(options: any) {
@@ -31,11 +59,17 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
   onJoin(client: Client, options: any) {
     console.log(client.sessionId, "joined!");
 
-    // Deterministic spawn ring, so two players never start on top of each other.
-    const angle = this.joinCount++ * 2.399963;
+    // Deterministic spawn in the 2x2 open plaza at the arena center — no
+    // Math.random(). `% SPAWN_TILES.length` keeps this safe even if more
+    // than 4 joins ever happen over the room's lifetime (leaves + rejoins).
+    const tile = SPAWN_TILES[this.joinCount % SPAWN_TILES.length];
+    this.joinCount++;
+
+    const spawn = getSpawnPixel(tile);
+
     this.state.players.set(client.sessionId, new Player({
-      x: ARENA_WIDTH / 2 + Math.cos(angle) * 80,
-      y: ARENA_HEIGHT / 2 + Math.sin(angle) * 80,
+      x: spawn.x,
+      y: spawn.y,
       vx: 0,
       vy: 0,
     }));

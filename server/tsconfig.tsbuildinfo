@@ -1,0 +1,1 @@
+{"root":["./src/app.config.ts","./src/client/index.ts","./src/rooms/myroom.ts","./src/rooms/schema/myroomstate.ts","./src/shared/constants.ts","./src/shared/doorbellconstants.ts","./src/shared/doorbellmovement.ts","./src/shared/movement.ts","./test/myroom.test.ts","./loadtest/example.ts","./vite.config.ts"],"version":"5.9.3"}

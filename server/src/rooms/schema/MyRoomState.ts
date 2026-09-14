@@ -28,5 +28,10 @@ export const MyRoomState = schema({
 
   players: t.map(Player),
 
+  // Authoritative bottom-gate state. The server owns this; clients only
+  // ever request a toggle ("toggleDoor" message) and react to the
+  // synchronized value.
+  doorOpen: t.boolean(),
+
 });
 export type MyRoomState = SchemaType<typeof MyRoomState>;

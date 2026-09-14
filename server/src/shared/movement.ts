@@ -1,4 +1,4 @@
-import { ARENA_WIDTH, ARENA_HEIGHT, PLAYER_HALF, PLAYER_SPEED } from "./constants.js";
+import { ARENA_LEFT, ARENA_TOP, ARENA_RIGHT, ARENA_BOTTOM, PLAYER_HALF, PLAYER_SPEED } from "./constants.js";
 
 /**
  * Structural types on purpose: the same step runs on a server Schema instance
@@ -35,8 +35,10 @@ export function stepEntity(entity: EntityState, input: MoveInputLike, dt: number
   const x = entity.x + vx * dt;
   const y = entity.y + vy * dt;
 
-  const clampedX = clamp(x, PLAYER_HALF, ARENA_WIDTH - PLAYER_HALF);
-  const clampedY = clamp(y, PLAYER_HALF, ARENA_HEIGHT - PLAYER_HALF);
+  // Milestone 5: one outer arena boundary, no bedroom/gate carve-out.
+  // Bedroom/door wall collision returns as separate gameplay geometry later.
+  const clampedX = clamp(x, ARENA_LEFT + PLAYER_HALF, ARENA_RIGHT - PLAYER_HALF);
+  const clampedY = clamp(y, ARENA_TOP + PLAYER_HALF, ARENA_BOTTOM - PLAYER_HALF);
 
   // Hitting a wall also kills the velocity heading into it, so the reconciler
   // replays the same stop the server did.
