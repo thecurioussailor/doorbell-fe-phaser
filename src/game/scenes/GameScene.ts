@@ -24,10 +24,9 @@ export class GameScene extends Phaser.Scene {
     private buildTiles: BuildTile[] = [];
     private guns: Gun[] = [];
 
-    // There is one shared doorOpen state (see MyRoomState), rendered
-    // identically across all four rooms' doors — standing near any one of
-    // them toggles all four together. Per-room door state is deferred.
-    private doorIsOpen = false;
+    // Cache of each room's synchronized door state, indexed exactly like
+    // MyRoomState.doorsOpen / server ROOM_POSITIONS / this.roomPositions.
+    private doorsOpen: boolean[] = [];
     private doorBodies: Phaser.Physics.Arcade.StaticBody[] = [];
     private doorGraphics: Phaser.GameObjects.Graphics[] = [];
     private doorPositions: PixelPosition[] = [];
@@ -89,17 +88,18 @@ export class GameScene extends Phaser.Scene {
 
                 const $ = getStateCallbacks(room);
 
-                // The server owns doorOpen — this only reacts to it. `true`
-                // (immediate) applies the current value right away, so a
-                // client joining an already-open room renders correctly
-                // without waiting for the next toggle.
-                $(room.state).listen("doorOpen", (doorOpen) => {
-                    if (doorOpen) {
-                        this.openDoor();
-                    } else {
-                        this.closeDoor();
-                    }
+                // The server owns doorsOpen — this only reacts to it. onAdd
+                // fires once per existing entry immediately on subscribe
+                // (all 4, already pushed server-side before any client can
+                // join), so a client joining mid-game renders every room's
+                // current state right away, not just future toggles.
+                $(room.state).doorsOpen.onAdd((isOpen: boolean, roomIndex: number) => {
+                    this.setDoorVisual(roomIndex, isOpen);
                 }, true);
+
+                $(room.state).doorsOpen.onChange((isOpen: boolean, roomIndex: number) => {
+                    this.setDoorVisual(roomIndex, isOpen);
+                });
 
                 $(room.state).players.onAdd((remotePlayerState, sessionId) => {
                     // The server also creates a state entry for us. The local
@@ -289,14 +289,14 @@ export class GameScene extends Phaser.Scene {
             this.interactText.setVisible(true);
 
             this.interactText.setText(
-                this.doorIsOpen
+                this.doorsOpen[nearbyDoor.roomIndex]
                     ? "E  CLOSE DOOR"
                     : "E  OPEN DOOR"
             );
 
             this.interactText.setPosition(
-                nearbyDoor.x - 60,
-                nearbyDoor.y - 55
+                nearbyDoor.position.x - 60,
+                nearbyDoor.position.y - 55
             );
 
             return;
@@ -534,46 +534,50 @@ export class GameScene extends Phaser.Scene {
         return this.getNearbyBed() !== undefined;
     }
 
-    private getNearbyDoor(): PixelPosition | undefined {
-        return this.doorPositions.find((position) =>
-            Phaser.Math.Distance.Between(this.player.x, this.player.y, position.x, position.y) < 75
-        );
+    private getNearbyDoor(): { roomIndex: number; position: PixelPosition } | undefined {
+        for (let roomIndex = 0; roomIndex < this.doorPositions.length; roomIndex++) {
+            const position = this.doorPositions[roomIndex];
+
+            if (Phaser.Math.Distance.Between(this.player.x, this.player.y, position.x, position.y) < 75) {
+                return { roomIndex, position };
+            }
+        }
+
+        return undefined;
     }
 
     private isPlayerNearDoor(): boolean {
         return this.getNearbyDoor() !== undefined;
     }
 
-    // Requests a toggle — does NOT flip doorIsOpen itself. The server
-    // validates proximity against its own authoritative player position and
-    // decides; openDoor()/closeDoor() only run once that decision comes
-    // back through the doorOpen state listener above.
+    // Requests a toggle for the nearest door's room — does NOT flip
+    // doorsOpen itself. The server validates proximity (against its own
+    // authoritative player position, never a client-supplied one) and
+    // decides; setDoorVisual() only runs once that decision comes back
+    // through the doorsOpen state listener above.
     private toggleDoor() {
-        this.room?.send("toggleDoor");
+        const nearbyDoor = this.getNearbyDoor();
+
+        if (!nearbyDoor) {
+            return;
+        }
+
+        this.room?.send("toggleDoor", { roomIndex: nearbyDoor.roomIndex });
     }
 
-    private openDoor() {
-        this.doorIsOpen = true;
+    private setDoorVisual(roomIndex: number, isOpen: boolean) {
+        this.doorsOpen[roomIndex] = isOpen;
 
-        this.doorBodies.forEach((body) => {
-            body.enable = false;
-        });
+        const body = this.doorBodies[roomIndex];
+        const graphics = this.doorGraphics[roomIndex];
+        const position = this.doorPositions[roomIndex];
 
-        this.doorGraphics.forEach((graphics, index) => {
-            this.drawDoorVisual(graphics, this.doorPositions[index], true);
-        });
-    }
+        if (!body || !graphics || !position) {
+            return;
+        }
 
-    private closeDoor() {
-        this.doorIsOpen = false;
-
-        this.doorBodies.forEach((body) => {
-            body.enable = true;
-        });
-
-        this.doorGraphics.forEach((graphics, index) => {
-            this.drawDoorVisual(graphics, this.doorPositions[index], false);
-        });
+        body.enable = !isOpen;
+        this.drawDoorVisual(graphics, position, isOpen);
     }
 
     private toggleSleeping() {

@@ -28,10 +28,12 @@ export const MyRoomState = schema({
 
   players: t.map(Player),
 
-  // Authoritative bottom-gate state. The server owns this; clients only
-  // ever request a toggle ("toggleDoor" message) and react to the
-  // synchronized value.
-  doorOpen: t.boolean(),
+  // One independent door state per room, indexed exactly like
+  // server/src/shared/constants.ts ROOM_POSITIONS (doorsOpen[i] is room
+  // i's door). The server owns this; clients only ever request a toggle
+  // ("toggleDoor" message, { roomIndex }) and react to the synchronized
+  // value. Populated with 4 `false` entries in MyRoom.onCreate().
+  doorsOpen: t.array("boolean"),
 
 });
 export type MyRoomState = SchemaType<typeof MyRoomState>;

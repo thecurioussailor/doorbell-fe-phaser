@@ -6,11 +6,15 @@ import {
   ROOM_POSITIONS, getRoomDoorPixel, DOOR_INTERACT_RADIUS,
 } from "../shared/constants.js";
 
+interface ToggleDoorMessage {
+  roomIndex?: number;
+}
+
 export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
   // Milestone 5: the room is sized for exactly the 4 players the arena
   // has deterministic spawn slots for.
   maxClients = 4;
-  state = new MyRoomState({ doorOpen: false });
+  state = new MyRoomState();
 
   /**
    * Per-client input buffer. `sanitize` clamps every field as it is decoded —
@@ -29,30 +33,41 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
     // only for things that are not inputs (chat, emotes, …).
 
     /**
-     * The client only ever REQUESTS a toggle — it never sets doorOpen
-     * itself. Validated here against the requesting player's own
-     * authoritative server-side position (never a client-supplied one).
-     * There is one shared doorOpen state, reachable from any of the four
-     * rooms' doors — standing near ANY of them and pressing E toggles the
-     * same state for all four. (Four independent door states is deferred
-     * — that's room-specific gameplay, out of scope for this milestone.)
+     * The client only ever REQUESTS a toggle for a specific room — it never
+     * sets doorsOpen itself and never supplies a door position. Validated
+     * here: roomIndex must be a real room, the player must exist, and the
+     * player's own authoritative server-side position (never a
+     * client-supplied one) must be close enough to THAT room's door. Only
+     * that one room's door state changes.
      */
-    toggleDoor: (client: Client) => {
+    toggleDoor: (client: Client, message: ToggleDoorMessage) => {
       const player = this.state.players.get(client.sessionId);
       if (!player) { return; }
 
-      const isNearAnyDoor = ROOM_POSITIONS.some((room) => {
-        const door = getRoomDoorPixel(room);
-        return Math.hypot(player.x - door.x, player.y - door.y) <= DOOR_INTERACT_RADIUS;
-      });
+      const roomIndex = message?.roomIndex;
 
-      if (!isNearAnyDoor) { return; }
+      if (
+        typeof roomIndex !== "number" ||
+        !Number.isInteger(roomIndex) ||
+        roomIndex < 0 ||
+        roomIndex >= ROOM_POSITIONS.length
+      ) {
+        return;
+      }
 
-      this.state.doorOpen = !this.state.doorOpen;
+      const door = getRoomDoorPixel(ROOM_POSITIONS[roomIndex]);
+      const distance = Math.hypot(player.x - door.x, player.y - door.y);
+
+      if (distance > DOOR_INTERACT_RADIUS) { return; }
+
+      this.state.doorsOpen[roomIndex] = !this.state.doorsOpen[roomIndex];
     },
   };
 
   onCreate(options: any) {
+    // Four independent doors, one per ROOM_POSITIONS entry, all starting closed.
+    this.state.doorsOpen.push(false, false, false, false);
+
     this.setFixedTimestep((ctx) => this.step(ctx), TICK_RATE);
   }
 
@@ -95,7 +110,7 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
       if (!channel) { continue; }
 
       for (const input of channel) {
-        stepEntity(player, input, ctx.dt);
+        stepEntity(player, input, ctx.dt, this.state.doorsOpen);
       }
     }
   }

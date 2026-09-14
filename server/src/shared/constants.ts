@@ -119,10 +119,11 @@ export function getRoomBedPixel(room: { tileX: number; tileY: number }): { x: nu
 }
 
 /**
- * Server-authoritative door-toggle interaction radius. There is currently
- * one shared `doorOpen` state (MyRoomState), reachable from any of the
- * four rooms' doors — see MyRoom.ts's `toggleDoor` handler. Matches
- * GameScene's own proximity check, used only for its UI prompt.
+ * Server-authoritative door-toggle interaction radius. Each of the four
+ * rooms has its own independent door state (MyRoomState.doorsOpen) — see
+ * MyRoom.ts's `toggleDoor` handler, which validates against the specific
+ * room's door the client names. Matches GameScene's own proximity check,
+ * used only for its UI prompt.
  */
 export const DOOR_INTERACT_RADIUS = 75;
 
