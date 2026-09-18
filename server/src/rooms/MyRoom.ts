@@ -4,6 +4,7 @@ import { stepEntity } from "../shared/movement.js";
 import {
   TICK_RATE, SPAWN_TILES, getSpawnPixel,
   ROOM_POSITIONS, getRoomDoorPixel, DOOR_INTERACT_RADIUS,
+  getRoomBedPixel, getRoomIndexAtPosition, BED_INTERACT_RADIUS,
 } from "../shared/constants.js";
 
 interface ToggleDoorMessage {
@@ -62,6 +63,47 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
 
       this.state.doorsOpen[roomIndex] = !this.state.doorsOpen[roomIndex];
     },
+
+    /**
+     * The client only ever REQUESTS a sleep/wake toggle — no payload, no
+     * client-supplied position or room. The server derives everything:
+     * room membership from the player's own authoritative x/y, the bed
+     * from that room's fixed geometry, and rejects if too far away or if
+     * another player is already sleeping in that room.
+     */
+    toggleSleep: (client: Client) => {
+      const player = this.state.players.get(client.sessionId);
+      if (!player) { return; }
+
+      // Waking up never needs a proximity check — keep the current
+      // authoritative position, just resume movement.
+      if (player.sleeping) {
+        player.sleeping = false;
+        return;
+      }
+
+      const roomIndex = getRoomIndexAtPosition(player.x, player.y);
+      if (roomIndex === -1) { return; }
+
+      const bed = getRoomBedPixel(ROOM_POSITIONS[roomIndex]);
+      const distance = Math.hypot(player.x - bed.x, player.y - bed.y);
+      if (distance > BED_INTERACT_RADIUS) { return; }
+
+      // At most one sleeping player per room — a temporary occupancy
+      // rule, not permanent room ownership (that's a later milestone).
+      for (const other of this.state.players.values()) {
+        if (other !== player && other.sleeping && other.roomIndex === roomIndex) {
+          return;
+        }
+      }
+
+      player.x = bed.x;
+      player.y = bed.y;
+      player.vx = 0;
+      player.vy = 0;
+      player.roomIndex = roomIndex;
+      player.sleeping = true;
+    },
   };
 
   onCreate(options: any) {
@@ -87,6 +129,8 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
       y: spawn.y,
       vx: 0,
       vy: 0,
+      roomIndex: -1,
+      sleeping: false,
     }));
   }
 
@@ -102,16 +146,28 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
   /**
    * One shared `stepEntity` per received input, so the set the client predicted
    * is exactly the set the server applied. A client that sends nothing simply
-   * does not move — an empty tick advances no one.
+   * does not move — an empty tick advances no one. A sleeping player's inputs
+   * are still drained (so nothing backs up in the buffer while asleep) but
+   * never applied — this is the authoritative "sleeping players can't move"
+   * rule; the client also stops sending input while sleeping, but the server
+   * doesn't rely on that.
+   *
+   * Room membership is recomputed every tick for every player, regardless of
+   * whether they moved, so it never drifts from their actual position.
    */
   private step(ctx: StepContext) {
     for (const [sessionId, player] of this.state.players) {
       const channel = this.inputs.get(sessionId);
-      if (!channel) { continue; }
 
-      for (const input of channel) {
-        stepEntity(player, input, ctx.dt, this.state.doorsOpen);
+      if (channel) {
+        for (const input of channel) {
+          if (!player.sleeping) {
+            stepEntity(player, input, ctx.dt, this.state.doorsOpen);
+          }
+        }
       }
+
+      player.roomIndex = getRoomIndexAtPosition(player.x, player.y);
     }
   }
 

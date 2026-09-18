@@ -21,6 +21,15 @@ export const Player = schema({
   y: t.number(),
   vx: t.number(),
   vy: t.number(),
+
+  // Authoritative room membership, derived server-side from x/y (see
+  // getRoomIndexAtPosition) — never trust a client-claimed roomIndex.
+  // -1 means "in the open arena, not inside any room."
+  roomIndex: t.int8().default(-1),
+
+  // Authoritative sleeping state — the server, not the client, decides
+  // this (see MyRoom.ts's "toggleSleep" message handler).
+  sleeping: t.boolean().default(false),
 });
 export type Player = SchemaType<typeof Player>;
 

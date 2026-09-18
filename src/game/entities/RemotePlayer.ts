@@ -1,5 +1,8 @@
 import Phaser from "phaser";
 
+const AWAKE_TINT = 0xc86b6b;
+const SLEEPING_TINT = 0x7a4646;
+
 /**
  * Visual-only stand-in for a networked player. Deliberately not a
  * Phaser.Physics.Arcade.Sprite and does not read keyboard input — this
@@ -12,6 +15,12 @@ export class RemotePlayer extends Phaser.GameObjects.Sprite {
         scene.add.existing(this);
 
         this.setDisplaySize(32, 32);
-        this.setTint(0xc86b6b);
+        this.setTint(AWAKE_TINT);
+    }
+
+    // Dims the existing red tint rather than adding new visual elements —
+    // enough to tell a sleeping remote player apart from a moving one.
+    setSleeping(isSleeping: boolean) {
+        this.setTint(isSleeping ? SLEEPING_TINT : AWAKE_TINT);
     }
 }

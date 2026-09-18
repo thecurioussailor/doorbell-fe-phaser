@@ -119,6 +119,35 @@ export function getRoomBedPixel(room: { tileX: number; tileY: number }): { x: nu
 }
 
 /**
+ * Which room (0-3) a pixel position lies inside, or -1 if it's outside all
+ * four — the server's one source of truth for room membership, derived
+ * from the same ROOM_POSITIONS/ROOM_WIDTH/ROOM_HEIGHT every other room
+ * calculation uses. A position inside a room's wall ring counts as inside
+ * the room; players can never actually be positioned in a wall tile
+ * anyway, since movement collision (movement.ts) already prevents it.
+ */
+export function getRoomIndexAtPosition(x: number, y: number): number {
+  for (let index = 0; index < ROOM_POSITIONS.length; index++) {
+    const origin = getRoomPixelPosition(ROOM_POSITIONS[index]);
+
+    if (
+      x >= origin.x && x <= origin.x + ROOM_WIDTH &&
+      y >= origin.y && y <= origin.y + ROOM_HEIGHT
+    ) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+/**
+ * Server-authoritative bed-toggle interaction radius. Matches GameScene's
+ * own bed proximity check (distance < 45), used only for its UI prompt.
+ */
+export const BED_INTERACT_RADIUS = 45;
+
+/**
  * Server-authoritative door-toggle interaction radius. Each of the four
  * rooms has its own independent door state (MyRoomState.doorsOpen) — see
  * MyRoom.ts's `toggleDoor` handler, which validates against the specific

@@ -113,6 +113,14 @@ export class GameScene extends Phaser.Scene {
                                 remotePlayerState.y
                             );
                         });
+
+                        // The server owns sleeping — this only reacts to
+                        // it. `true` (immediate) applies the current value
+                        // right away for a client joining mid-sleep.
+                        $(remotePlayerState).listen("sleeping", (isSleeping: boolean) => {
+                            this.applySleepingState(isSleeping);
+                        }, true);
+
                         return;
                     }
 
@@ -130,6 +138,10 @@ export class GameScene extends Phaser.Scene {
                             remotePlayerState.y
                         );
                     });
+
+                    $(remotePlayerState).listen("sleeping", (isSleeping: boolean) => {
+                        remotePlayer.setSleeping(isSleeping);
+                    }, true);
                 });
 
                 $(room.state).players.onRemove((_remotePlayerState, sessionId) => {
@@ -225,7 +237,12 @@ export class GameScene extends Phaser.Scene {
 
         this.input.keyboard!.on("keydown-E", () => {
 
+            // Already sleeping: E only ever wakes up — no door interaction
+            // while asleep. `isSleeping` here mirrors the server's
+            // authoritative `sleeping`; the actual transition still has to
+            // round-trip through the server (see toggleSleeping()).
             if (this.isSleeping) {
+                this.toggleSleeping();
                 return;
             }
 
@@ -247,8 +264,8 @@ export class GameScene extends Phaser.Scene {
     }
 
     update(_time: number, delta: number) {
-        // If the player is sleeping,
-        // don't allow movement.
+        // If the player is sleeping (server-authoritative — see
+        // applySleepingState()), don't allow movement.
         if (this.isSleeping) {
             // Accumulate the time that has passed
             this.coinAccumulator += delta;
@@ -263,6 +280,15 @@ export class GameScene extends Phaser.Scene {
 
                 this.coinAccumulator -= 1000;
             }
+
+            // Re-anchored every frame (rather than once, on the sleeping
+            // transition) so it can't show stale if the position sync and
+            // the sleeping-state sync land in different network patches.
+            this.sleepingText.setPosition(
+                this.player.x - 45,
+                this.player.y + 90
+            );
+
             // Don't process movement while sleeping
             return;
         }
@@ -580,64 +606,41 @@ export class GameScene extends Phaser.Scene {
         this.drawDoorVisual(graphics, position, isOpen);
     }
 
+    // Requests a sleep/wake toggle — does NOT flip isSleeping itself. The
+    // server derives room + bed from the player's own authoritative
+    // position, validates proximity and room occupancy, and decides;
+    // applySleepingState() only runs once that decision comes back through
+    // the "sleeping" state listener above. No payload: the server already
+    // knows the player's position, and waking needs no location at all.
     private toggleSleeping() {
-        this.isSleeping = !this.isSleeping;
+        this.room?.send("toggleSleep");
+    }
 
-        if (this.isSleeping) {
-            this.startSleeping();
+    // Reacts to the server's authoritative `sleeping` value — for both the
+    // local player and (via a symmetric listener above) every remote one.
+    // Position itself is handled generically by the existing per-player
+    // onChange -> applyServerPosition/setPosition pipeline, since the
+    // server snaps x/y to the bed as part of the same state change.
+    private applySleepingState(isSleeping: boolean) {
+        this.isSleeping = isSleeping;
+
+        this.buildTiles.forEach((tile) => {
+            tile.setBuildMode(isSleeping);
+        });
+
+        this.sleepingText.setVisible(isSleeping);
+
+        if (isSleeping) {
+            this.interactText.setVisible(false);
+            // Best-effort immediate placement; update() re-anchors this
+            // every frame afterward regardless.
+            this.sleepingText.setPosition(
+                this.player.x - 45,
+                this.player.y + 90
+            );
         } else {
-            this.stopSleeping();
+            this.coinAccumulator = 0;
         }
-    }
-
-    private startSleeping() {
-        const bed = this.getNearbyBed();
-
-        if (!bed) {
-            return;
-        }
-
-        this.isSleeping = true;
-
-        this.buildTiles.forEach((tile) => {
-            tile.setBuildMode(true);
-        });
-
-        // Move the player to the center of the bed
-        this.player.setPosition(
-            bed.x,
-            bed.y
-        );
-
-        // Stop all movement
-        const body = this.player.body as Phaser.Physics.Arcade.Body;
-        body.setVelocity(0, 0);
-
-        // Hide interaction prompt
-        this.interactText.setVisible(false);
-
-        // Show sleeping state
-        this.sleepingText.setVisible(true);
-
-        this.sleepingText.setPosition(
-            bed.x - 45,
-            bed.y + 90
-        );
-    }
-
-    private stopSleeping() {
-        this.isSleeping = false;
-
-        this.buildTiles.forEach((tile) => {
-            tile.setBuildMode(false);
-        });
-
-        this.sleepingText.setVisible(false);
-
-        const body = this.player.body as Phaser.Physics.Arcade.Body;
-        body.setVelocity(0, 0);
-
-        this.coinAccumulator = 0;
     }
 
     private openBuildMenu(tile: BuildTile) {
