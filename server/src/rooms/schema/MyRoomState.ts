@@ -1,5 +1,6 @@
 import { schema, t, type SchemaType } from "@colyseus/schema";
 import { PLAYER_MAX_HEALTH } from "../../shared/constants.js";
+import type { MatchPhase } from "../../shared/matchPhase.js";
 
 /**
  * One input frame, consumed by `Room.defineInput()`. Flat primitives only, and
@@ -96,6 +97,13 @@ export const MyRoomState = schema({
 
   // Every built gun, keyed by its server-generated id ("gun-1", ...).
   guns: t.map(Gun),
+
+  // Server-owned match phase — see shared/matchPhase.ts. Clients only read it.
+  phase: t.string<MatchPhase>().default(""),
+
+  // Informational countdown for the HUD, whole seconds, updated only when
+  // it changes. The server's own ms timer (MyRoom) is what ends preparation.
+  preparationSecondsLeft: t.int8().default(0),
 
 });
 export type MyRoomState = SchemaType<typeof MyRoomState>;

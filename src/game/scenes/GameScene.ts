@@ -56,6 +56,7 @@ export class GameScene extends Phaser.Scene {
     private isDraggingCamera = false;
 
     private coinsText!: Phaser.GameObjects.Text;
+    private phaseText!: Phaser.GameObjects.Text;
     private sleepingText!: Phaser.GameObjects.Text;
     private buildMenu?: Phaser.GameObjects.Container;
 
@@ -107,6 +108,10 @@ export class GameScene extends Phaser.Scene {
                 this.moveInput = room.input();
 
                 const $ = getStateCallbacks(room);
+
+                // Display only: the server alone decides when preparation ends.
+                $(room.state).listen("phase", () => this.updatePhaseText(), true);
+                $(room.state).listen("preparationSecondsLeft", () => this.updatePhaseText(), true);
 
                 // The server owns doorsOpen — this only reacts to it. onAdd
                 // fires once per existing entry immediately on subscribe
@@ -287,6 +292,14 @@ export class GameScene extends Phaser.Scene {
             }
         );
         this.coinsText.setScrollFactor(0);
+
+        this.phaseText = this.add.text(40, 115, "", {
+            fontFamily: "monospace",
+            fontSize: "18px",
+            color: "#8fd8ff",
+        });
+        this.phaseText.setScrollFactor(0);
+
         this.interactText = this.add.text(
             0,
             0,
@@ -769,6 +782,19 @@ export class GameScene extends Phaser.Scene {
 
         body.enable = !isOpen;
         this.drawDoorVisual(graphics, position, isOpen, isLocked);
+    }
+
+    private updatePhaseText() {
+        const state = this.room?.state;
+        if (!state) { return; }
+
+        if (state.phase === "preparation") {
+            this.phaseText.setText(`PREPARATION  ${state.preparationSecondsLeft}`);
+        } else if (state.phase === "active") {
+            this.phaseText.setText("ACTIVE");
+        } else {
+            this.phaseText.setText("");
+        }
     }
 
     private setGhostSession(sessionId: string, role: string) {

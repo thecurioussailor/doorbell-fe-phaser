@@ -8,9 +8,10 @@ import {
   ROOM_POSITIONS, getRoomDoorPixel, DOOR_INTERACT_RADIUS,
   getRoomBedPixel, getRoomIndexAtPosition, BED_INTERACT_RADIUS,
   BUILD_TILES_PER_ROOM, GUN_COST, COIN_INTERVAL_MS, getRoomBuildTilePixel, GUN_RANGE,
-  MAX_PLAYERS, GHOST_SPAWN_TILE,
+  MAX_PLAYERS, GHOST_SPAWN_TILE, PREPARATION_DURATION_MS,
 } from "../shared/constants.js";
 import { pickGhost } from "../shared/roles.js";
+import { stepMatchPhase } from "../shared/matchPhase.js";
 
 interface ToggleDoorMessage {
   roomIndex?: number;
@@ -28,6 +29,10 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
   // Set once, when the room first reaches MAX_PLAYERS (the stand-in for
   // "match start" until the lobby exists). Roles never re-roll after that.
   private rolesAssigned = false;
+
+  // Server-only ms left in preparation; state.preparationSecondsLeft is
+  // just its rounded-up display value.
+  private preparationRemainingMs = 0;
 
   // Source of randomness for Ghost selection — replaceable in tests.
   random: () => number = Math.random;
@@ -266,6 +271,30 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
       ghost.vx = 0;
       ghost.vy = 0;
     }
+
+    this.state.phase = "preparation";
+    this.preparationRemainingMs = PREPARATION_DURATION_MS;
+    this.state.preparationSecondsLeft = Math.ceil(PREPARATION_DURATION_MS / 1000);
+  }
+
+  /** Advances the server-owned phase clock; the only place preparation ends. */
+  private advancePhase(dtMs: number) {
+    const next = stepMatchPhase(this.state.phase, this.preparationRemainingMs, dtMs);
+    this.preparationRemainingMs = next.preparationRemainingMs;
+
+    if (next.phase !== this.state.phase) {
+      this.state.phase = next.phase;
+    }
+
+    const secondsLeft = Math.ceil(next.preparationRemainingMs / 1000);
+    if (secondsLeft !== this.state.preparationSecondsLeft) {
+      this.state.preparationSecondsLeft = secondsLeft;
+    }
+  }
+
+  /** The Ghost is held in place until the preparation phase ends. */
+  private isFrozen(player: Player): boolean {
+    return player.role === "ghost" && this.state.phase === "preparation";
   }
 
   onLeave(client: Client, code: CloseCode) {
@@ -291,12 +320,17 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
    * whether they moved, so it never drifts from their actual position.
    */
   private step(ctx: StepContext) {
+    // First, so the tick on which preparation ends already runs as "active".
+    this.advancePhase(ctx.dt * 1000);
+
     for (const [sessionId, player] of this.state.players) {
       const channel = this.inputs.get(sessionId);
 
       if (channel) {
+        // Inputs are always drained; sleeping players and a frozen Ghost
+        // just don't have them applied.
         for (const input of channel) {
-          if (!player.sleeping) {
+          if (!player.sleeping && !this.isFrozen(player)) {
             stepEntity(player, input, ctx.dt, this.state.doorsOpen);
           }
         }
@@ -354,6 +388,12 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
         ghost = player;
         break;
       }
+    }
+
+    // An unreleased Ghost isn't a valid target: no target means no shot,
+    // so no damage, for the whole preparation phase.
+    if (ghost && this.isFrozen(ghost)) {
+      ghost = undefined;
     }
 
     for (const gun of this.state.guns.values()) {

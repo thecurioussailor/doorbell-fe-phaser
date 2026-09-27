@@ -10,6 +10,8 @@ import {
   MAX_PLAYERS, GHOST_SPAWN_TILE, SPAWN_TILES, getSpawnPixel, getRoomIndexAtPosition,
 } from "../src/shared/constants.js";
 import { pickGhost } from "../src/shared/roles.js";
+import { stepMatchPhase } from "../src/shared/matchPhase.js";
+import { PREPARATION_DURATION_MS } from "../src/shared/constants.js";
 import { stepGunFiring, type FiringGun } from "../src/shared/gunFiring.js";
 import { applyGunDamage, type DamageTarget } from "../src/shared/gunDamage.js";
 
@@ -626,6 +628,31 @@ describe("testing your Colyseus app", () => {
     });
   });
 
+  // Deterministic: the phase clock with exact 30Hz tick deltas, so the
+  // 25-second boundary is checked to the tick without waiting 25 real seconds.
+  describe("stepMatchPhase", () => {
+    const TICK_MS = 1000 / TICK_RATE;
+    const TICKS_TO_ACTIVE = Math.round(PREPARATION_DURATION_MS / TICK_MS); // 750
+
+    it("ends preparation after exactly PREPARATION_DURATION_MS of ticks", () => {
+      let clock = { phase: "preparation" as const, preparationRemainingMs: PREPARATION_DURATION_MS } as any;
+
+      for (let i = 0; i < TICKS_TO_ACTIVE - 1; i++) {
+        clock = stepMatchPhase(clock.phase, clock.preparationRemainingMs, TICK_MS);
+      }
+      assert.strictEqual(clock.phase, "preparation", "one tick short of 25s");
+
+      clock = stepMatchPhase(clock.phase, clock.preparationRemainingMs, TICK_MS);
+      assert.strictEqual(clock.phase, "active", "active at exactly 25s");
+      assert.strictEqual(clock.preparationRemainingMs, 0);
+    });
+
+    it("never moves out of active, and never starts on its own", () => {
+      assert.deepStrictEqual(stepMatchPhase("active", 0, 10_000), { phase: "active", preparationRemainingMs: 0 });
+      assert.deepStrictEqual(stepMatchPhase("", 0, 10_000), { phase: "", preparationRemainingMs: 0 });
+    });
+  });
+
   describe("pickGhost", () => {
     it("picks by the injected random value and handles the edges", () => {
       const ids = ["a", "b", "c", "d", "e"];
@@ -649,6 +676,15 @@ describe("testing your Colyseus app", () => {
 
     function roles(room: any) {
       return [...room.state.players.values()].map((p: any) => p.role);
+    }
+
+    // Fast-forwards the server's own preparation timer so the next tick
+    // performs the real transition, instead of waiting 25s of wall clock.
+    async function endPreparation(room: any) {
+      room.preparationRemainingMs = 0;
+      while (room.state.phase !== "active") {
+        await room.waitForNextTimestep();
+      }
     }
 
     function ghostEntry(room: any): [string, any] {
@@ -753,9 +789,10 @@ describe("testing your Colyseus app", () => {
       });
     });
 
-    it("lets the Ghost move through the normal authoritative movement", async () => {
+    it("lets the Ghost move through the normal authoritative movement once active", async () => {
       const room = await colyseus.createRoom<MyRoomState>("my_room", {});
       const clients = await connectPlayers(room, 5);
+      await endPreparation(room);
       const [ghostId, ghost] = ghostEntry(room);
       const ghostClient = clients.find((c) => c.sessionId === ghostId);
       const startX = ghost.x;
@@ -831,9 +868,10 @@ describe("testing your Colyseus app", () => {
       assert.strictEqual(room.state.buildTilesOccupied[1 * BUILD_TILES_PER_ROOM + 2], true);
     });
 
-    it("lets existing guns target and damage the real Ghost", async () => {
+    it("lets existing guns target and damage the real Ghost once active", async () => {
       const room = await colyseus.createRoom<MyRoomState>("my_room", {});
       await connectPlayers(room, 5);
+      await endPreparation(room);
       const [ghostId, ghost] = ghostEntry(room);
 
       room.state.guns.set("gun-a", new Gun({
@@ -845,6 +883,172 @@ describe("testing your Colyseus app", () => {
       assert.strictEqual(gun.targetId, ghostId);
       assert.strictEqual(gun.fireSequence, 1);
       assert.strictEqual(ghost.health, PLAYER_MAX_HEALTH - GUN_DAMAGE);
+    });
+
+    describe("preparation phase", () => {
+      it("starts in preparation when the 5th player joins, not before", async () => {
+        const room = await colyseus.createRoom<MyRoomState>("my_room", {});
+        await connectPlayers(room, 4);
+        assert.strictEqual(room.state.phase, "");
+
+        await connectPlayers(room, 1);
+        assert.strictEqual(room.state.phase, "preparation");
+        assert.strictEqual(PREPARATION_DURATION_MS, 25_000);
+        assert.strictEqual(room.state.preparationSecondsLeft, 25);
+      });
+
+      it("freezes the Ghost at its spawn: movement input is ignored", async () => {
+        const room = await colyseus.createRoom<MyRoomState>("my_room", {});
+        const clients = await connectPlayers(room, 5);
+        const [ghostId, ghost] = ghostEntry(room);
+        const ghostClient = clients.find((c) => c.sessionId === ghostId);
+        const spawn = getSpawnPixel(GHOST_SPAWN_TILE);
+
+        const input = ghostClient.input<MoveInput>({ mode: "reliable" });
+        for (let i = 0; i < 5; i++) {
+          input.data.moveX = 1;
+          input.data.moveY = 1;
+          input.send();
+          await room.waitForNextMessage();
+          await room.waitForNextTimestep();
+        }
+
+        assert.strictEqual(room.state.phase, "preparation");
+        assert.strictEqual(ghost.x, spawn.x);
+        assert.strictEqual(ghost.y, spawn.y);
+      });
+
+      it("keeps the Ghost unable to sleep or build during preparation", async () => {
+        const room = await colyseus.createRoom<MyRoomState>("my_room", {});
+        const clients = await connectPlayers(room, 5);
+        const [ghostId, ghost] = ghostEntry(room);
+        const ghostClient = clients.find((c) => c.sessionId === ghostId);
+        assert.strictEqual(room.state.phase, "preparation");
+
+        const bed = getRoomBedPixel(ROOM_POSITIONS[0]);
+        ghost.x = bed.x;
+        ghost.y = bed.y;
+        ghostClient.send("toggleSleep");
+        await room.waitForNextMessage();
+        assert.strictEqual(ghost.sleeping, false);
+
+        ghost.roomIndex = 0;
+        ghost.sleeping = true;
+        ghost.coins = GUN_COST;
+        ghostClient.send("build", { tileIndex: 0 });
+        await room.waitForNextMessage();
+        assert.strictEqual(room.state.guns.size, 0);
+        assert.strictEqual(ghost.coins, GUN_COST);
+      });
+
+      it("lets Defenders move, sleep, and build during preparation", async () => {
+        const room = await colyseus.createRoom<MyRoomState>("my_room", {});
+        const clients = await connectPlayers(room, 5);
+        const defenders = clients.filter((c) => room.state.players.get(c.sessionId).role === "defender");
+        assert.strictEqual(room.state.phase, "preparation");
+
+        const mover = room.state.players.get(defenders[0].sessionId);
+        const startX = mover.x;
+        const input = defenders[0].input<MoveInput>({ mode: "reliable" });
+        input.data.moveX = 1;
+        input.data.moveY = 0;
+        input.send();
+        await room.waitForNextMessage();
+        await room.waitForNextTimestep();
+        assert.strictEqual(mover.x, startX + PLAYER_SPEED * (1 / TICK_RATE));
+
+        const builder = room.state.players.get(defenders[1].sessionId);
+        const bed = getRoomBedPixel(ROOM_POSITIONS[2]);
+        builder.x = bed.x;
+        builder.y = bed.y;
+        defenders[1].send("toggleSleep");
+        await room.waitForNextMessage();
+        assert.strictEqual(builder.sleeping, true);
+
+        builder.coins = GUN_COST;
+        defenders[1].send("build", { tileIndex: 5 });
+        await room.waitForNextMessage();
+        assert.strictEqual(room.state.guns.size, 1);
+        assert.strictEqual(builder.coins, 0);
+        assert.strictEqual(room.state.phase, "preparation");
+      });
+
+      it("does not let guns target, fire at, or damage the Ghost during preparation", async () => {
+        const room = await colyseus.createRoom<MyRoomState>("my_room", {});
+        await connectPlayers(room, 5);
+        const [, ghost] = ghostEntry(room);
+
+        room.state.guns.set("gun-a", new Gun({
+          id: "gun-a", roomIndex: 0, tileIndex: 0, x: ghost.x + 50, y: ghost.y, type: "basic",
+        }));
+        for (let i = 0; i < 10; i++) { await room.waitForNextTimestep(); }
+
+        const gun = room.state.guns.get("gun-a");
+        assert.strictEqual(room.state.phase, "preparation");
+        assert.strictEqual(gun.targetId, "");
+        assert.strictEqual(gun.fireSequence, 0);
+        assert.strictEqual(ghost.health, PLAYER_MAX_HEALTH);
+      });
+
+      it("transitions to active on the server tick, releasing the Ghost to move and be shot", async () => {
+        const room = await colyseus.createRoom<MyRoomState>("my_room", {});
+        const clients = await connectPlayers(room, 5);
+        const [ghostId, ghost] = ghostEntry(room);
+        const ghostClient = clients.find((c) => c.sessionId === ghostId);
+        room.state.guns.set("gun-a", new Gun({
+          id: "gun-a", roomIndex: 0, tileIndex: 0, x: ghost.x + 50, y: ghost.y, type: "basic",
+        }));
+
+        // Last sliver of the real timer: the next server tick ends it.
+        (room as any).preparationRemainingMs = 1;
+        await room.waitForNextTimestep();
+
+        assert.strictEqual(room.state.phase, "active");
+        assert.strictEqual(room.state.preparationSecondsLeft, 0);
+        assert.deepStrictEqual({ x: ghost.x, y: ghost.y }, getSpawnPixel(GHOST_SPAWN_TILE), "still at spawn on release");
+
+        const gun = room.state.guns.get("gun-a");
+        assert.strictEqual(gun.targetId, ghostId, "targetable on the release tick");
+        assert.strictEqual(gun.fireSequence, 1);
+        assert.strictEqual(ghost.health, PLAYER_MAX_HEALTH - GUN_DAMAGE);
+
+        const startY = ghost.y;
+        const input = ghostClient.input<MoveInput>({ mode: "reliable" });
+        input.data.moveX = 0;
+        input.data.moveY = 1;
+        input.send();
+        await room.waitForNextMessage();
+        await room.waitForNextTimestep();
+        assert.strictEqual(ghost.y, startY + PLAYER_SPEED * (1 / TICK_RATE));
+      });
+
+      it("never reverts from active, even if the room refills to 5", async () => {
+        const room = await colyseus.createRoom<MyRoomState>("my_room", {});
+        const clients = await connectPlayers(room, 5);
+        await endPreparation(room);
+
+        for (let i = 0; i < 10; i++) { await room.waitForNextTimestep(); }
+        assert.strictEqual(room.state.phase, "active");
+
+        const leaver = clients.find((c) => room.state.players.get(c.sessionId).role === "defender");
+        await leaver.leave();
+        while (room.state.players.size === 5) { await room.waitForNextTimestep(); }
+        await connectPlayers(room, 1);
+
+        assert.strictEqual(room.state.phase, "active");
+        assert.strictEqual(roles(room).filter((x) => x === "ghost").length, 1);
+      });
+
+      it("syncs phase and the countdown to clients", async () => {
+        const room = await colyseus.createRoom<MyRoomState>("my_room", {});
+        const clients = await connectPlayers(room, 5);
+        const observer = clients[0];
+
+        await waitForClientState(observer, () => observer.state.phase === "preparation" && observer.state.preparationSecondsLeft === 25);
+
+        await endPreparation(room);
+        await waitForClientState(observer, () => observer.state.phase === "active");
+      });
     });
 
     it("wakes a player picked as Ghost while asleep and unlocks their room", async () => {

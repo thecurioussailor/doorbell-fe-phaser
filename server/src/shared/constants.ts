@@ -241,6 +241,9 @@ export const GHOST_SPAWN_TILE = { tileX: 2, tileY: 11 };
 /** Players per match: 4 Defenders + 1 Ghost. */
 export const MAX_PLAYERS = 5;
 
+/** How long the Ghost is held at its spawn after roles are assigned. */
+export const PREPARATION_DURATION_MS = 25_000;
+
 /** Spawn pixel = tile CENTER (players render from their center point). */
 export function getSpawnPixel(tile: { tileX: number; tileY: number }): { x: number; y: number } {
   return {
