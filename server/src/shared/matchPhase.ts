@@ -1,11 +1,10 @@
 /**
  * "lobby"       = players gathering and readying up; no roles yet,
- * "starting"    = host's START GAME accepted; room locked (10B turns this
- *                 into role assignment + preparation),
- * "preparation" = Ghost held at spawn, Defenders set up,
+ * "preparation" = entered only by the host's valid START GAME; Ghost held
+ *                 at spawn, Defenders set up,
  * "active"      = Ghost released. Only ever moves forward.
  */
-export type MatchPhase = "lobby" | "starting" | "preparation" | "active";
+export type MatchPhase = "lobby" | "preparation" | "active";
 
 // Absorbs float error from summing tick deltas (750 x 1000/30 is not
 // exactly 25000), so the transition lands on the tick the timer truly ends.

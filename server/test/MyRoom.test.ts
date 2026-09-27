@@ -28,6 +28,24 @@ async function waitForClientState(client: any, predicate: () => boolean, maxPatc
   assert.ok(predicate(), `client state did not converge within ${maxPatches} patches`);
 }
 
+// Resolves after the server's handler for this message type has run.
+// (waitForNextMessage() also fires on the SDK's own internal messages.)
+async function sendAndWait(room: any, client: any, type: string, payload?: any) {
+  const handled = room.waitForMessage(type);
+  client.send(type, payload);
+  await handled;
+}
+
+// The real match start: everyone readies, then the host (the first client
+// to join) sends START GAME. This is the only way a match begins.
+async function startViaHost(room: any, clientsInJoinOrder: any[]) {
+  for (const c of clientsInJoinOrder) {
+    await sendAndWait(room, c, "ready", { ready: true });
+  }
+  await sendAndWait(room, clientsInJoinOrder[0], "startGame");
+  assert.strictEqual(room.state.phase, "preparation", "START GAME was accepted");
+}
+
 describe("testing your Colyseus app", () => {
   let colyseus: ColyseusTestServer<typeof appConfig>;
 
@@ -654,7 +672,6 @@ describe("testing your Colyseus app", () => {
     it("never moves out of active, and never starts on its own", () => {
       assert.deepStrictEqual(stepMatchPhase("active", 0, 10_000), { phase: "active", preparationRemainingMs: 0 });
       assert.deepStrictEqual(stepMatchPhase("lobby", 0, 10_000), { phase: "lobby", preparationRemainingMs: 0 });
-      assert.deepStrictEqual(stepMatchPhase("starting", 0, 10_000), { phase: "starting", preparationRemainingMs: 0 });
     });
   });
 
@@ -679,11 +696,10 @@ describe("testing your Colyseus app", () => {
       return clients;
     }
 
-    // A full room plus the match start (role assignment + preparation).
-    // Calls beginMatch() directly: 10B wires the host's START GAME to it.
+    // A full room, all ready, started by the host's START GAME.
     async function connectMatch(room: any) {
       const clients = await connectPlayers(room, MAX_PLAYERS);
-      room.beginMatch();
+      await startViaHost(room, clients);
       return clients;
     }
 
@@ -762,20 +778,26 @@ describe("testing your Colyseus app", () => {
       assert.deepStrictEqual(after, before);
     });
 
-    it("ignores a client trying to choose its role", async () => {
+    it("ignores a role requested in join options", async () => {
       const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-      const clients = await connectPlayers(room, 4, { role: "ghost" });
+      const clients = await connectPlayers(room, 5, { role: "ghost" });
+      assert.deepStrictEqual(roles(room).filter((x) => x === "ghost"), [], "no Ghost before START");
 
-      for (const c of clients) {
-        c.send("setRole", { role: "ghost" });
-        c.send("role", "ghost");
-      }
-      await room.waitForNextTimestep();
-      assert.deepStrictEqual(roles(room), ["defender", "defender", "defender", "defender"]);
+      await startViaHost(room, clients);
+      assert.strictEqual(roles(room).filter((x) => x === "ghost").length, 1, "still exactly one, server-chosen");
+    });
 
-      await connectPlayers(room, 1, { role: "ghost" });
-      (room as any).beginMatch();
-      assert.strictEqual(roles(room).filter((x) => x === "ghost").length, 1);
+    it("never grants a role from a client message", async () => {
+      const room = await colyseus.createRoom<MyRoomState>("my_room", {});
+      const [, cheater] = await connectPlayers(room, 2);
+
+      // Unregistered message types: Colyseus drops the sender outside dev
+      // mode (and only errors in dev mode) — either way, no role change.
+      cheater.send("setRole" as any, { role: "ghost" });
+      cheater.send("role" as any, "ghost");
+      for (let i = 0; i < 5; i++) { await room.waitForNextTimestep(); }
+
+      assert.deepStrictEqual(roles(room).filter((x) => x === "ghost"), []);
     });
 
     it("places the Ghost at the dedicated spawn, outside every room", async () => {
@@ -900,12 +922,14 @@ describe("testing your Colyseus app", () => {
     });
 
     describe("preparation phase", () => {
-      it("starts preparation only when the match begins, not on the 5th join", async () => {
+      it("starts preparation only on the host's START, not on the 5th join", async () => {
         const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-        await connectPlayers(room, 5);
+        const clients = await connectPlayers(room, 5);
+        await room.waitForNextTimestep();
         assert.strictEqual(room.state.phase, "lobby");
+        assert.strictEqual(room.state.preparationSecondsLeft, 0);
 
-        (room as any).beginMatch();
+        await startViaHost(room, clients);
         assert.strictEqual(room.state.phase, "preparation");
         assert.strictEqual(PREPARATION_DURATION_MS, 25_000);
         assert.strictEqual(room.state.preparationSecondsLeft, 25);
@@ -1036,7 +1060,7 @@ describe("testing your Colyseus app", () => {
         assert.strictEqual(ghost.y, startY + PLAYER_SPEED * (1 / TICK_RATE));
       });
 
-      it("never reverts from active; a second beginMatch and late joins change nothing", async () => {
+      it("never reverts from active; a second START and late joins change nothing", async () => {
         const room = await colyseus.createRoom<MyRoomState>("my_room", {});
         const clients = await connectMatch(room);
         await endPreparation(room);
@@ -1045,7 +1069,7 @@ describe("testing your Colyseus app", () => {
         for (let i = 0; i < 10; i++) { await room.waitForNextTimestep(); }
         assert.strictEqual(room.state.phase, "active");
 
-        (room as any).beginMatch();
+        await sendAndWait(room, clients[0], "startGame");
         assert.strictEqual(room.state.phase, "active", "no restart of preparation");
         assert.strictEqual(ghostEntry(room)[0], ghostId, "no role re-roll");
 
@@ -1083,8 +1107,8 @@ describe("testing your Colyseus app", () => {
       await room.waitForNextMessage();
       assert.strictEqual(room.state.doorsLocked[0], true);
 
-      await connectPlayers(room, 4);
-      (room as any).beginMatch();
+      const rest = await connectPlayers(room, 4);
+      await startViaHost(room, [first, ...rest]);
 
       assert.strictEqual(sleeper.role, "ghost");
       assert.strictEqual(sleeper.sleeping, false);
@@ -1114,14 +1138,6 @@ describe("testing your Colyseus app", () => {
       const { hostClient, room, code } = await createLobby();
       const others = await joinLobby(code, 4);
       return { hostClient, room, code, others, all: [hostClient, ...others] };
-    }
-
-    // Resolves after the server's handler for this message type has run.
-    // (waitForNextMessage() also fires on the SDK's own internal messages.)
-    async function sendAndWait(room: any, client: any, type: string, payload?: any) {
-      const handled = room.waitForMessage(type);
-      client.send(type, payload);
-      await handled;
     }
 
     async function readyUp(room: any, clients: any[]) {
@@ -1251,20 +1267,46 @@ describe("testing your Colyseus app", () => {
       assert.strictEqual(room.state.phase, "lobby");
     });
 
-    it("accepts START from the host with 5 ready players: 'starting', locked, no roles yet", async () => {
-      const { hostClient, room, code, all } = await fullLobby();
+    it("valid host START begins the real match: 1 Ghost at spawn, 4 Defenders, 25s preparation", async () => {
+      const { hostClient, room, all } = await fullLobby();
       await readyUp(room, all);
+      const defenderSpawns = new Map(all.map((c) => {
+        const p = room.state.players.get(c.sessionId);
+        return [c.sessionId, { x: p.x, y: p.y }];
+      }));
 
       await sendAndWait(room, hostClient, "startGame");
 
-      assert.strictEqual(room.state.phase, "starting");
+      assert.strictEqual(room.state.phase, "preparation");
       assert.strictEqual(room.locked, true);
-      assert.ok([...room.state.players.values()].every((p: any) => p.role === "defender"), "roles are 10B");
-      assert.strictEqual(room.state.preparationSecondsLeft, 0, "no preparation yet");
+      assert.strictEqual(room.state.preparationSecondsLeft, Math.ceil(PREPARATION_DURATION_MS / 1000));
 
-      await waitForClientState(hostClient, () => hostClient.state.phase === "starting");
+      const players = [...room.state.players.entries()] as [string, any][];
+      const ghosts = players.filter(([, p]) => p.role === "ghost");
+      const defenders = players.filter(([, p]) => p.role === "defender");
+      assert.strictEqual(ghosts.length, 1);
+      assert.strictEqual(defenders.length, 4);
 
-      // Once started: no more joins, no second start, ready is frozen.
+      const [, ghost] = ghosts[0];
+      assert.deepStrictEqual({ x: ghost.x, y: ghost.y }, getSpawnPixel(GHOST_SPAWN_TILE));
+      for (const [id, p] of defenders) {
+        assert.deepStrictEqual({ x: p.x, y: p.y }, defenderSpawns.get(id), "Defenders keep their spawn");
+      }
+
+      // Every client sees the same public roles and the preparation phase.
+      for (const c of all) {
+        await waitForClientState(c, () =>
+          c.state.phase === "preparation" && c.state.players.get(ghosts[0][0])?.role === "ghost");
+      }
+    });
+
+    it("once started: no joins, no second START, no ready changes, no host handover", async () => {
+      const { hostClient, room, code, all } = await fullLobby();
+      await readyUp(room, all);
+      await sendAndWait(room, hostClient, "startGame");
+      const rolesBefore = [...room.state.players.entries()].map(([id, p]: [string, any]) => `${id}:${p.role}`);
+      const remainingAtStart = room.preparationRemainingMs;
+
       const leaver = all[4];
       await leaver.leave();
       while (room.state.players.size === 5) { await room.waitForNextTimestep(); }
@@ -1272,8 +1314,18 @@ describe("testing your Colyseus app", () => {
 
       await sendAndWait(room, hostClient, "ready", { ready: false });
       await sendAndWait(room, hostClient, "startGame");
-      assert.strictEqual(room.state.players.get(hostClient.sessionId).ready, true);
-      assert.strictEqual(room.state.phase, "starting");
+      assert.strictEqual(room.state.players.get(hostClient.sessionId).ready, true, "ready is frozen");
+      assert.strictEqual(room.state.phase, "preparation");
+      await room.waitForNextTimestep();
+      assert.ok(room.preparationRemainingMs < remainingAtStart, "preparation kept counting down, not restarted");
+
+      const hostId = hostClient.sessionId;
+      await hostClient.leave();
+      while (room.state.players.has(hostId)) { await room.waitForNextTimestep(); }
+      assert.strictEqual(room.state.hostId, hostId, "host is not handed over mid-match");
+
+      const rolesAfter = [...room.state.players.entries()].map(([id, p]: [string, any]) => `${id}:${p.role}`);
+      assert.deepStrictEqual(rolesAfter, rolesBefore.filter((r) => !r.startsWith(`${leaver.sessionId}:`) && !r.startsWith(`${hostId}:`)));
     });
 
     it("removes a leaving player from the lobby", async () => {
@@ -1300,7 +1352,7 @@ describe("testing your Colyseus app", () => {
       const [refill] = await joinLobby(code, 1);
       await readyUp(room, [...others, refill]);
       await sendAndWait(room, others[0], "startGame");
-      assert.strictEqual(room.state.phase, "starting");
+      assert.strictEqual(room.state.phase, "preparation");
     });
   });
 });

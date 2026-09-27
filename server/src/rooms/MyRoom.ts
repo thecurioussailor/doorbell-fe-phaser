@@ -31,7 +31,7 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
   maxClients = MAX_PLAYERS;
   state = new MyRoomState();
 
-  // Set once by beginMatch(); roles never re-roll after that.
+  // Set once by startMatch(); roles never re-roll after that.
   private rolesAssigned = false;
 
   // Server-only ms left in preparation; state.preparationSecondsLeft is
@@ -79,9 +79,10 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
     },
 
     /**
-     * Host-only. Accepted only in the lobby with exactly MAX_PLAYERS
-     * players, all ready. On success the room locks and moves to
-     * "starting"; role assignment + preparation are wired to this in 10B.
+     * Host-only, and the ONLY way a match begins. Accepted only in the
+     * lobby with exactly MAX_PLAYERS players, all ready. On success the
+     * room locks and the match starts in the same message: roles, Ghost
+     * spawn, "preparation".
      */
     startGame: (client: Client) => {
       if (this.state.phase !== "lobby") { return; }
@@ -92,8 +93,8 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
         if (!player.ready) { return; }
       }
 
-      this.state.phase = "starting";
       this.lock();
+      this.startMatch();
     },
 
     /**
@@ -299,12 +300,12 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
   }
 
   /**
-   * Exactly one Ghost, chosen server-side; everyone else stays a Defender
-   * (the schema default). The Ghost moves to its own spawn outside every
-   * room; Defenders keep wherever they are; preparation begins. Runs once
-   * per room. Not yet called by startGame — that connection is 10B.
+   * Called only from a validated startGame. Exactly one Ghost, chosen
+   * server-side; everyone else stays a Defender (the schema default). The
+   * Ghost moves to its own spawn outside every room; Defenders keep
+   * wherever they are; preparation begins. Runs once per room.
    */
-  beginMatch() {
+  private startMatch() {
     if (this.rolesAssigned) { return; }
     this.rolesAssigned = true;
 
@@ -363,8 +364,9 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
     this.coinAccumulatorsMs.delete(client.sessionId);
 
     // Hand host to the longest-connected remaining player (map order is
-    // join order), so the lobby can still be started.
-    if (this.state.hostId === client.sessionId) {
+    // join order), so the lobby can still be started. Lobby only: once the
+    // match has started the host has no further powers to hand over.
+    if (this.state.phase === "lobby" && this.state.hostId === client.sessionId) {
       const next = this.state.players.keys().next();
       this.state.hostId = next.done ? "" : next.value;
     }
