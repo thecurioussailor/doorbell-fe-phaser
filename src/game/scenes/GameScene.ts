@@ -1,7 +1,7 @@
 import Phaser from "phaser";
 import { getStateCallbacks, type InputHandle, type Room } from "@colyseus/sdk";
 import { Player } from "../entities/Player";
-import { RemotePlayer } from "../entities/RemotePlayer";
+import { RemotePlayer, GHOST_TINT, GHOST_ALPHA } from "../entities/RemotePlayer";
 import { Bed } from "../entities/Bed";
 import { BuildTile } from "../entities/BuildTile";
 import { Gun } from "../entities/Gun";
@@ -44,6 +44,11 @@ export class GameScene extends Phaser.Scene {
     private doorPositions: PixelPosition[] = [];
 
     private isSleeping = false;
+
+    // Mirrors the synced Player.role — public, never decided client-side.
+    private isLocalGhost = false;
+    private ghostSessionId = "";
+    private ghostLabel!: Phaser.GameObjects.Text;
 
     // Free-look camera panning, enabled only while sleeping (see
     // applySleepingState()). Client-side only — never synchronized, and
@@ -187,6 +192,15 @@ export class GameScene extends Phaser.Scene {
                             this.coinsText.setText(`COINS  ${coins}`);
                         }, true);
 
+                        $(remotePlayerState).listen("role", (role: string) => {
+                            this.isLocalGhost = role === "ghost";
+                            if (this.isLocalGhost) {
+                                this.player.setTint(GHOST_TINT);
+                                this.player.setAlpha(GHOST_ALPHA);
+                            }
+                            this.setGhostSession(sessionId, role);
+                        }, true);
+
                         return;
                     }
 
@@ -208,11 +222,19 @@ export class GameScene extends Phaser.Scene {
                     $(remotePlayerState).listen("sleeping", (isSleeping: boolean) => {
                         remotePlayer.setSleeping(isSleeping);
                     }, true);
+
+                    $(remotePlayerState).listen("role", (role: string) => {
+                        remotePlayer.setRole(role);
+                        this.setGhostSession(sessionId, role);
+                    }, true);
                 });
 
                 $(room.state).players.onRemove((_remotePlayerState, sessionId) => {
                     this.remotePlayers.get(sessionId)?.destroy();
                     this.remotePlayers.delete(sessionId);
+                    if (this.ghostSessionId === sessionId) {
+                        this.ghostSessionId = "";
+                    }
                 });
             })
             .catch((error) => {
@@ -301,6 +323,14 @@ export class GameScene extends Phaser.Scene {
 
         this.sleepingText.setVisible(false);
 
+        this.ghostLabel = this.add.text(0, 0, "GHOST", {
+            fontFamily: "monospace",
+            fontSize: "12px",
+            color: "#8fd8ff",
+        });
+        this.ghostLabel.setOrigin(0.5, 1);
+        this.ghostLabel.setVisible(false);
+
         this.input.keyboard!.on("keydown-E", () => {
 
             // Already sleeping: E only ever wakes up — no door interaction
@@ -318,8 +348,8 @@ export class GameScene extends Phaser.Scene {
                 return;
             }
 
-            // Otherwise check bed
-            if (this.isPlayerNearBed()) {
+            // Otherwise check bed (the server rejects Ghost sleep regardless)
+            if (!this.isLocalGhost && this.isPlayerNearBed()) {
                 this.toggleSleeping();
             }
         });
@@ -367,6 +397,8 @@ export class GameScene extends Phaser.Scene {
     }
 
     update(_time: number, _delta: number) {
+        this.updateGhostLabel();
+
         // If the player is sleeping (server-authoritative — see
         // applySleepingState()), don't allow movement.
         if (this.isSleeping) {
@@ -422,7 +454,7 @@ export class GameScene extends Phaser.Scene {
             return;
         }
 
-        const nearbyBed = this.getNearbyBed();
+        const nearbyBed = this.isLocalGhost ? undefined : this.getNearbyBed();
 
         if (nearbyBed) {
 
@@ -737,6 +769,30 @@ export class GameScene extends Phaser.Scene {
 
         body.enable = !isOpen;
         this.drawDoorVisual(graphics, position, isOpen, isLocked);
+    }
+
+    private setGhostSession(sessionId: string, role: string) {
+        if (role === "ghost") {
+            this.ghostSessionId = sessionId;
+        } else if (this.ghostSessionId === sessionId) {
+            this.ghostSessionId = "";
+        }
+    }
+
+    // Before update()'s sleeping early-return, so the label keeps tracking
+    // the Ghost for a sleeping defender too.
+    private updateGhostLabel() {
+        const sprite = this.ghostSessionId === this.room?.sessionId
+            ? this.player
+            : this.remotePlayers.get(this.ghostSessionId);
+
+        if (!this.ghostSessionId || !sprite) {
+            this.ghostLabel.setVisible(false);
+            return;
+        }
+
+        this.ghostLabel.setVisible(true);
+        this.ghostLabel.setPosition(sprite.x, sprite.y - 20);
     }
 
     // Requests a sleep/wake toggle — does NOT flip isSleeping itself. The

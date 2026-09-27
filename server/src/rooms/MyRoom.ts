@@ -2,12 +2,15 @@ import { Room, Client, CloseCode, type StepContext } from "colyseus";
 import { MyRoomState, Player, MoveInput, Gun } from "./schema/MyRoomState.js";
 import { stepEntity } from "../shared/movement.js";
 import { stepGunFiring } from "../shared/gunFiring.js";
+import { applyGunDamage } from "../shared/gunDamage.js";
 import {
   TICK_RATE, SPAWN_TILES, getSpawnPixel,
   ROOM_POSITIONS, getRoomDoorPixel, DOOR_INTERACT_RADIUS,
   getRoomBedPixel, getRoomIndexAtPosition, BED_INTERACT_RADIUS,
   BUILD_TILES_PER_ROOM, GUN_COST, COIN_INTERVAL_MS, getRoomBuildTilePixel, GUN_RANGE,
+  MAX_PLAYERS, GHOST_SPAWN_TILE,
 } from "../shared/constants.js";
+import { pickGhost } from "../shared/roles.js";
 
 interface ToggleDoorMessage {
   roomIndex?: number;
@@ -18,10 +21,16 @@ interface BuildMessage {
 }
 
 export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
-  // Milestone 5: the room is sized for exactly the 4 players the arena
-  // has deterministic spawn slots for.
-  maxClients = 4;
+  // 4 Defenders + 1 Ghost.
+  maxClients = MAX_PLAYERS;
   state = new MyRoomState();
+
+  // Set once, when the room first reaches MAX_PLAYERS (the stand-in for
+  // "match start" until the lobby exists). Roles never re-roll after that.
+  private rolesAssigned = false;
+
+  // Source of randomness for Ghost selection — replaceable in tests.
+  random: () => number = Math.random;
 
   /**
    * Per-client input buffer. `sanitize` clamps every field as it is decoded —
@@ -93,6 +102,7 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
     toggleSleep: (client: Client) => {
       const player = this.state.players.get(client.sessionId);
       if (!player) { return; }
+      if (player.role === "ghost") { return; }
 
       // Waking up never needs a proximity check — keep the current
       // authoritative position, just resume movement. The room's door
@@ -148,6 +158,7 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
       if (!player) { return; }
 
       // Only the sleeping defender of a room may build in it.
+      if (player.role === "ghost") { return; }
       if (!player.sleeping) { return; }
       if (player.roomIndex < 0) { return; }
 
@@ -218,6 +229,43 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
       roomIndex: -1,
       sleeping: false,
     }));
+
+    if (!this.rolesAssigned && this.state.players.size === MAX_PLAYERS) {
+      this.assignRoles();
+    }
+  }
+
+  /**
+   * Exactly one Ghost, chosen server-side; everyone else stays a Defender
+   * (the schema default). The Ghost moves to its own spawn outside every
+   * room; Defenders keep wherever they are. Runs once per room.
+   */
+  private assignRoles() {
+    this.rolesAssigned = true;
+
+    const ghostId = pickGhost([...this.state.players.keys()], this.random);
+
+    for (const [sessionId, player] of this.state.players) {
+      player.role = sessionId === ghostId ? "ghost" : "defender";
+    }
+
+    const ghost = this.state.players.get(ghostId);
+    if (ghost) {
+      // A player picked while asleep in a room must not leave that room's
+      // door locked behind them, or stay "sleeping" as the Ghost.
+      if (ghost.sleeping) {
+        ghost.sleeping = false;
+        if (ghost.roomIndex !== -1) {
+          this.state.doorsLocked[ghost.roomIndex] = false;
+        }
+      }
+
+      const spawn = getSpawnPixel(GHOST_SPAWN_TILE);
+      ghost.x = spawn.x;
+      ghost.y = spawn.y;
+      ghost.vx = 0;
+      ghost.vy = 0;
+    }
   }
 
   onLeave(client: Client, code: CloseCode) {
@@ -278,12 +326,16 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
 
     this.updateGunTargets();
 
-    stepGunFiring(
+    const firedGuns = stepGunFiring(
       this.state.guns.values(),
       (sessionId) => this.state.players.has(sessionId),
       this.gunCooldownsMs,
       ctx.dt * 1000,
     );
+
+    for (const gun of firedGuns) {
+      applyGunDamage(gun, this.state.players.get(gun.targetId));
+    }
   }
 
   /**

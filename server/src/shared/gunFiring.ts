@@ -20,14 +20,17 @@ const COOLDOWN_EPSILON_MS = 1e-6;
  * The cooldown counts down every step whether or not there's a target, and
  * is clamped at 0: idle time can't bank extra shots, and dropping and
  * reacquiring a target can't skip a cooldown already in progress.
+ *
+ * Returns the guns that fired on this step — the only input damage uses.
  */
-export function stepGunFiring(
-  guns: Iterable<FiringGun>,
+export function stepGunFiring<G extends FiringGun>(
+  guns: Iterable<G>,
   playerExists: (sessionId: string) => boolean,
   cooldownsMs: Map<string, number>,
   dtMs: number,
-): void {
+): G[] {
   const liveGunIds = new Set<string>();
+  const fired: G[] = [];
 
   for (const gun of guns) {
     liveGunIds.add(gun.id);
@@ -41,6 +44,7 @@ export function stepGunFiring(
     if (gun.targetId !== "" && cooldown <= COOLDOWN_EPSILON_MS) {
       gun.fireSequence += 1;
       cooldown = GUN_FIRE_RATE_MS;
+      fired.push(gun);
     }
 
     cooldownsMs.set(gun.id, Math.max(0, cooldown - dtMs));
@@ -51,4 +55,6 @@ export function stepGunFiring(
       cooldownsMs.delete(gunId);
     }
   }
+
+  return fired;
 }

@@ -1,4 +1,5 @@
 import { schema, t, type SchemaType } from "@colyseus/schema";
+import { PLAYER_MAX_HEALTH } from "../../shared/constants.js";
 
 /**
  * One input frame, consumed by `Room.defineInput()`. Flat primitives only, and
@@ -40,6 +41,11 @@ export const Player = schema({
   // Public, not secret. Nothing assigns "ghost" yet — role assignment
   // comes with match start in a later milestone.
   role: t.string<"defender" | "ghost">().default("defender"),
+
+  // Server-only mutation: reduced by shared/gunDamage.ts on a real gun
+  // shot, clamped at 0. Nothing happens at 0 yet (no death/respawn).
+  maxHealth: t.number().default(PLAYER_MAX_HEALTH),
+  health: t.number().default(PLAYER_MAX_HEALTH),
 });
 export type Player = SchemaType<typeof Player>;
 
