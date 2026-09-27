@@ -1,5 +1,8 @@
 import assert from "assert";
 import { ColyseusTestServer, boot } from "@colyseus/testing";
+import { matchMaker } from "colyseus";
+
+const matchMakerQuery = () => matchMaker.query({ name: "my_room" });
 
 import appConfig from "../src/app.config.js";
 import { MyRoomState, Gun, type MoveInput } from "../src/rooms/schema/MyRoomState.js";
@@ -11,6 +14,7 @@ import {
 } from "../src/shared/constants.js";
 import { pickGhost } from "../src/shared/roles.js";
 import { stepMatchPhase } from "../src/shared/matchPhase.js";
+import { ROOM_CODE_ALPHABET, ROOM_CODE_LENGTH, generateRoomCode, normalizeRoomCode } from "../src/shared/roomCode.js";
 import { PREPARATION_DURATION_MS } from "../src/shared/constants.js";
 import { stepGunFiring, type FiringGun } from "../src/shared/gunFiring.js";
 import { applyGunDamage, type DamageTarget } from "../src/shared/gunDamage.js";
@@ -649,7 +653,8 @@ describe("testing your Colyseus app", () => {
 
     it("never moves out of active, and never starts on its own", () => {
       assert.deepStrictEqual(stepMatchPhase("active", 0, 10_000), { phase: "active", preparationRemainingMs: 0 });
-      assert.deepStrictEqual(stepMatchPhase("", 0, 10_000), { phase: "", preparationRemainingMs: 0 });
+      assert.deepStrictEqual(stepMatchPhase("lobby", 0, 10_000), { phase: "lobby", preparationRemainingMs: 0 });
+      assert.deepStrictEqual(stepMatchPhase("starting", 0, 10_000), { phase: "starting", preparationRemainingMs: 0 });
     });
   });
 
@@ -665,12 +670,20 @@ describe("testing your Colyseus app", () => {
   });
 
   describe("real human Ghost (5-player match)", () => {
-    // Clients in join order; the 5th join triggers role assignment.
+    // Clients in join order. Joining alone never starts a match.
     async function connectPlayers(room: any, count: number, options: any = {}) {
       const clients = [];
       for (let i = 0; i < count; i++) {
         clients.push(await colyseus.connectTo(room, options));
       }
+      return clients;
+    }
+
+    // A full room plus the match start (role assignment + preparation).
+    // Calls beginMatch() directly: 10B wires the host's START GAME to it.
+    async function connectMatch(room: any) {
+      const clients = await connectPlayers(room, MAX_PLAYERS);
+      room.beginMatch();
       return clients;
     }
 
@@ -715,7 +728,7 @@ describe("testing your Colyseus app", () => {
 
       for (let trial = 0; trial < 12; trial++) {
         const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-        const clients = await connectPlayers(room, 5);
+        const clients = await connectMatch(room);
 
         const r = roles(room);
         assert.strictEqual(r.filter((x) => x === "ghost").length, 1);
@@ -733,14 +746,14 @@ describe("testing your Colyseus app", () => {
     it("uses the room's injectable random source for the pick", async () => {
       const room = await colyseus.createRoom<MyRoomState>("my_room", {});
       (room as any).random = () => 0.9999;
-      const clients = await connectPlayers(room, 5);
+      const clients = await connectMatch(room);
 
       assert.strictEqual(room.state.players.get(clients[4].sessionId).role, "ghost");
     });
 
     it("keeps roles stable across ticks", async () => {
       const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-      await connectPlayers(room, 5);
+      await connectMatch(room);
       const before = [...room.state.players.entries()].map(([id, p]: [string, any]) => `${id}:${p.role}`);
 
       for (let i = 0; i < 10; i++) { await room.waitForNextTimestep(); }
@@ -761,12 +774,13 @@ describe("testing your Colyseus app", () => {
       assert.deepStrictEqual(roles(room), ["defender", "defender", "defender", "defender"]);
 
       await connectPlayers(room, 1, { role: "ghost" });
+      (room as any).beginMatch();
       assert.strictEqual(roles(room).filter((x) => x === "ghost").length, 1);
     });
 
     it("places the Ghost at the dedicated spawn, outside every room", async () => {
       const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-      await connectPlayers(room, 5);
+      await connectMatch(room);
       const [, ghost] = ghostEntry(room);
 
       const spawn = getSpawnPixel(GHOST_SPAWN_TILE);
@@ -778,7 +792,7 @@ describe("testing your Colyseus app", () => {
 
     it("leaves Defenders at their existing join-order spawn tiles", async () => {
       const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-      const clients = await connectPlayers(room, 5);
+      const clients = await connectMatch(room);
 
       clients.forEach((c, joinIndex) => {
         const p = room.state.players.get(c.sessionId);
@@ -791,7 +805,7 @@ describe("testing your Colyseus app", () => {
 
     it("lets the Ghost move through the normal authoritative movement once active", async () => {
       const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-      const clients = await connectPlayers(room, 5);
+      const clients = await connectMatch(room);
       await endPreparation(room);
       const [ghostId, ghost] = ghostEntry(room);
       const ghostClient = clients.find((c) => c.sessionId === ghostId);
@@ -809,7 +823,7 @@ describe("testing your Colyseus app", () => {
 
     it("rejects Ghost sleep, even standing on a bed", async () => {
       const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-      const clients = await connectPlayers(room, 5);
+      const clients = await connectMatch(room);
       const [ghostId, ghost] = ghostEntry(room);
       const ghostClient = clients.find((c) => c.sessionId === ghostId);
 
@@ -825,7 +839,7 @@ describe("testing your Colyseus app", () => {
 
     it("rejects Ghost builds without charging, even if its state were forced to sleeping", async () => {
       const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-      const clients = await connectPlayers(room, 5);
+      const clients = await connectMatch(room);
       const [ghostId, ghost] = ghostEntry(room);
       const ghostClient = clients.find((c) => c.sessionId === ghostId);
 
@@ -847,7 +861,7 @@ describe("testing your Colyseus app", () => {
 
     it("still lets a Defender sleep and build in a 5-player match", async () => {
       const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-      const clients = await connectPlayers(room, 5);
+      const clients = await connectMatch(room);
       const defenderClient = clients.find((c) => room.state.players.get(c.sessionId).role === "defender");
       const defender = room.state.players.get(defenderClient.sessionId);
 
@@ -870,7 +884,7 @@ describe("testing your Colyseus app", () => {
 
     it("lets existing guns target and damage the real Ghost once active", async () => {
       const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-      await connectPlayers(room, 5);
+      await connectMatch(room);
       await endPreparation(room);
       const [ghostId, ghost] = ghostEntry(room);
 
@@ -886,12 +900,12 @@ describe("testing your Colyseus app", () => {
     });
 
     describe("preparation phase", () => {
-      it("starts in preparation when the 5th player joins, not before", async () => {
+      it("starts preparation only when the match begins, not on the 5th join", async () => {
         const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-        await connectPlayers(room, 4);
-        assert.strictEqual(room.state.phase, "");
+        await connectPlayers(room, 5);
+        assert.strictEqual(room.state.phase, "lobby");
 
-        await connectPlayers(room, 1);
+        (room as any).beginMatch();
         assert.strictEqual(room.state.phase, "preparation");
         assert.strictEqual(PREPARATION_DURATION_MS, 25_000);
         assert.strictEqual(room.state.preparationSecondsLeft, 25);
@@ -899,7 +913,7 @@ describe("testing your Colyseus app", () => {
 
       it("freezes the Ghost at its spawn: movement input is ignored", async () => {
         const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-        const clients = await connectPlayers(room, 5);
+        const clients = await connectMatch(room);
         const [ghostId, ghost] = ghostEntry(room);
         const ghostClient = clients.find((c) => c.sessionId === ghostId);
         const spawn = getSpawnPixel(GHOST_SPAWN_TILE);
@@ -920,7 +934,7 @@ describe("testing your Colyseus app", () => {
 
       it("keeps the Ghost unable to sleep or build during preparation", async () => {
         const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-        const clients = await connectPlayers(room, 5);
+        const clients = await connectMatch(room);
         const [ghostId, ghost] = ghostEntry(room);
         const ghostClient = clients.find((c) => c.sessionId === ghostId);
         assert.strictEqual(room.state.phase, "preparation");
@@ -943,7 +957,7 @@ describe("testing your Colyseus app", () => {
 
       it("lets Defenders move, sleep, and build during preparation", async () => {
         const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-        const clients = await connectPlayers(room, 5);
+        const clients = await connectMatch(room);
         const defenders = clients.filter((c) => room.state.players.get(c.sessionId).role === "defender");
         assert.strictEqual(room.state.phase, "preparation");
 
@@ -975,7 +989,7 @@ describe("testing your Colyseus app", () => {
 
       it("does not let guns target, fire at, or damage the Ghost during preparation", async () => {
         const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-        await connectPlayers(room, 5);
+        await connectMatch(room);
         const [, ghost] = ghostEntry(room);
 
         room.state.guns.set("gun-a", new Gun({
@@ -992,7 +1006,7 @@ describe("testing your Colyseus app", () => {
 
       it("transitions to active on the server tick, releasing the Ghost to move and be shot", async () => {
         const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-        const clients = await connectPlayers(room, 5);
+        const clients = await connectMatch(room);
         const [ghostId, ghost] = ghostEntry(room);
         const ghostClient = clients.find((c) => c.sessionId === ghostId);
         room.state.guns.set("gun-a", new Gun({
@@ -1022,18 +1036,23 @@ describe("testing your Colyseus app", () => {
         assert.strictEqual(ghost.y, startY + PLAYER_SPEED * (1 / TICK_RATE));
       });
 
-      it("never reverts from active, even if the room refills to 5", async () => {
+      it("never reverts from active; a second beginMatch and late joins change nothing", async () => {
         const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-        const clients = await connectPlayers(room, 5);
+        const clients = await connectMatch(room);
         await endPreparation(room);
+        const [ghostId] = ghostEntry(room);
 
         for (let i = 0; i < 10; i++) { await room.waitForNextTimestep(); }
         assert.strictEqual(room.state.phase, "active");
 
+        (room as any).beginMatch();
+        assert.strictEqual(room.state.phase, "active", "no restart of preparation");
+        assert.strictEqual(ghostEntry(room)[0], ghostId, "no role re-roll");
+
         const leaver = clients.find((c) => room.state.players.get(c.sessionId).role === "defender");
         await leaver.leave();
         while (room.state.players.size === 5) { await room.waitForNextTimestep(); }
-        await connectPlayers(room, 1);
+        await assert.rejects(colyseus.connectTo(room), "no joining mid-match");
 
         assert.strictEqual(room.state.phase, "active");
         assert.strictEqual(roles(room).filter((x) => x === "ghost").length, 1);
@@ -1041,7 +1060,7 @@ describe("testing your Colyseus app", () => {
 
       it("syncs phase and the countdown to clients", async () => {
         const room = await colyseus.createRoom<MyRoomState>("my_room", {});
-        const clients = await connectPlayers(room, 5);
+        const clients = await connectMatch(room);
         const observer = clients[0];
 
         await waitForClientState(observer, () => observer.state.phase === "preparation" && observer.state.preparationSecondsLeft === 25);
@@ -1065,11 +1084,223 @@ describe("testing your Colyseus app", () => {
       assert.strictEqual(room.state.doorsLocked[0], true);
 
       await connectPlayers(room, 4);
+      (room as any).beginMatch();
 
       assert.strictEqual(sleeper.role, "ghost");
       assert.strictEqual(sleeper.sleeping, false);
       assert.strictEqual(room.state.doorsLocked[0], false);
       assert.deepStrictEqual({ x: sleeper.x, y: sleeper.y }, getSpawnPixel(GHOST_SPAWN_TILE));
+    });
+  });
+
+  // Driven through the real SDK client — create() / joinById(code) — which
+  // is exactly what the frontend's CREATE ROOM / JOIN ROOM buttons call.
+  describe("lobby (room code, host, ready, start)", () => {
+    async function createLobby() {
+      const hostClient = await colyseus.sdk.create("my_room");
+      const room: any = colyseus.getRoomById(hostClient.roomId);
+      return { hostClient, room, code: hostClient.roomId };
+    }
+
+    async function joinLobby(code: string, count: number) {
+      const clients = [];
+      for (let i = 0; i < count; i++) {
+        clients.push(await colyseus.sdk.joinById(code));
+      }
+      return clients;
+    }
+
+    async function fullLobby() {
+      const { hostClient, room, code } = await createLobby();
+      const others = await joinLobby(code, 4);
+      return { hostClient, room, code, others, all: [hostClient, ...others] };
+    }
+
+    // Resolves after the server's handler for this message type has run.
+    // (waitForNextMessage() also fires on the SDK's own internal messages.)
+    async function sendAndWait(room: any, client: any, type: string, payload?: any) {
+      const handled = room.waitForMessage(type);
+      client.send(type, payload);
+      await handled;
+    }
+
+    async function readyUp(room: any, clients: any[]) {
+      for (const c of clients) {
+        await sendAndWait(room, c, "ready", { ready: true });
+      }
+    }
+
+    it("generates a short, unambiguous room code and syncs it", async () => {
+      const { hostClient, room, code } = await createLobby();
+
+      assert.strictEqual(code.length, ROOM_CODE_LENGTH);
+      for (const ch of code) { assert.ok(ROOM_CODE_ALPHABET.includes(ch), `"${ch}" in alphabet`); }
+      assert.strictEqual(room.state.roomCode, code);
+      assert.notStrictEqual(code, hostClient.sessionId, "not derived from a session id");
+
+      await waitForClientState(hostClient, () => hostClient.state.roomCode === code);
+    });
+
+    it("generates codes only from the alphabet, and normalizes typed input", () => {
+      assert.strictEqual(generateRoomCode(() => 0), "AAAAA");
+      assert.strictEqual(generateRoomCode(() => 0.9999), "99999");
+      assert.strictEqual(normalizeRoomCode("  ab7k2 "), "AB7K2");
+    });
+
+    it("makes the creator host, and not later joiners", async () => {
+      const { hostClient, room, code } = await createLobby();
+      const [second] = await joinLobby(code, 1);
+
+      assert.strictEqual(room.state.hostId, hostClient.sessionId);
+      assert.notStrictEqual(room.state.hostId, second.sessionId);
+      await waitForClientState(second, () => second.state.hostId === hostClient.sessionId);
+    });
+
+    it("lets players join by code, up to 5, and rejects a 6th", async () => {
+      const { room, code } = await fullLobby();
+
+      assert.strictEqual(room.state.players.size, 5);
+      await assert.rejects(colyseus.sdk.joinById(code), "room is full");
+      assert.strictEqual(room.state.players.size, 5);
+    });
+
+    it("rejects an unknown room code without creating a room", async () => {
+      await createLobby();
+      const roomsBefore = (await matchMakerQuery()).length;
+
+      // "1" is not in the alphabet, so this code can never exist.
+      await assert.rejects(colyseus.sdk.joinById("ZZZZ1"));
+      assert.strictEqual((await matchMakerQuery()).length, roomsBefore);
+    });
+
+    it("starts everyone not ready, numbered in join order", async () => {
+      const { room, all } = await fullLobby();
+
+      all.forEach((c, i) => {
+        const p = room.state.players.get(c.sessionId);
+        assert.strictEqual(p.ready, false);
+        assert.strictEqual(p.playerNumber, i + 1);
+      });
+    });
+
+    it("lets a player set and clear only their own ready flag", async () => {
+      const { hostClient, room, code } = await createLobby();
+      const [other] = await joinLobby(code, 1);
+      const me = room.state.players.get(hostClient.sessionId);
+      const them = room.state.players.get(other.sessionId);
+
+      await sendAndWait(room, hostClient, "ready", { ready: true } as any);
+      assert.strictEqual(me.ready, true);
+
+      await sendAndWait(room, hostClient, "ready", { ready: false } as any);
+      assert.strictEqual(me.ready, false);
+
+      // No way to name another player: extra fields are ignored.
+      await sendAndWait(room, hostClient, "ready", { ready: true, sessionId: other.sessionId, target: other.sessionId } as any);
+      assert.strictEqual(them.ready, false, "the other player is untouched");
+      assert.strictEqual(me.ready, true, "only the sender changed");
+
+      await sendAndWait(room, hostClient, "ready", { ready: "yes" } as any);
+      assert.strictEqual(me.ready, true, "non-boolean payload ignored");
+
+      await waitForClientState(other, () => other.state.players.get(hostClient.sessionId)?.ready === true);
+    });
+
+    it("does not start a match when the 5th player joins", async () => {
+      const { room } = await fullLobby();
+      await room.waitForNextTimestep();
+
+      assert.strictEqual(room.state.phase, "lobby");
+      assert.strictEqual(room.state.preparationSecondsLeft, 0);
+      assert.ok([...room.state.players.values()].every((p: any) => p.role === "defender"), "no Ghost");
+    });
+
+    it("rejects START from a non-host", async () => {
+      const { room, all, others } = await fullLobby();
+      await readyUp(room, all);
+
+      await sendAndWait(room, others[0], "startGame");
+      assert.strictEqual(room.state.phase, "lobby");
+    });
+
+    it("rejects START with fewer than 5 players", async () => {
+      const { hostClient, room, code } = await createLobby();
+      const others = await joinLobby(code, 3);
+      await readyUp(room, [hostClient, ...others]);
+
+      await sendAndWait(room, hostClient, "startGame");
+      assert.strictEqual(room.state.phase, "lobby");
+    });
+
+    it("rejects START if anyone is not ready", async () => {
+      const { hostClient, room, all } = await fullLobby();
+      await readyUp(room, all.slice(0, 4));
+
+      await sendAndWait(room, hostClient, "startGame");
+      assert.strictEqual(room.state.phase, "lobby");
+    });
+
+    it("rejects START after the lobby drops below 5", async () => {
+      const { hostClient, room, all, others } = await fullLobby();
+      await readyUp(room, all);
+
+      await others[3].leave();
+      while (room.state.players.size === 5) { await room.waitForNextTimestep(); }
+
+      await sendAndWait(room, hostClient, "startGame");
+      assert.strictEqual(room.state.phase, "lobby");
+    });
+
+    it("accepts START from the host with 5 ready players: 'starting', locked, no roles yet", async () => {
+      const { hostClient, room, code, all } = await fullLobby();
+      await readyUp(room, all);
+
+      await sendAndWait(room, hostClient, "startGame");
+
+      assert.strictEqual(room.state.phase, "starting");
+      assert.strictEqual(room.locked, true);
+      assert.ok([...room.state.players.values()].every((p: any) => p.role === "defender"), "roles are 10B");
+      assert.strictEqual(room.state.preparationSecondsLeft, 0, "no preparation yet");
+
+      await waitForClientState(hostClient, () => hostClient.state.phase === "starting");
+
+      // Once started: no more joins, no second start, ready is frozen.
+      const leaver = all[4];
+      await leaver.leave();
+      while (room.state.players.size === 5) { await room.waitForNextTimestep(); }
+      await assert.rejects(colyseus.sdk.joinById(code), "no joining a started match");
+
+      await sendAndWait(room, hostClient, "ready", { ready: false });
+      await sendAndWait(room, hostClient, "startGame");
+      assert.strictEqual(room.state.players.get(hostClient.sessionId).ready, true);
+      assert.strictEqual(room.state.phase, "starting");
+    });
+
+    it("removes a leaving player from the lobby", async () => {
+      const { room, others } = await fullLobby();
+      const leaverId = others[1].sessionId;
+
+      await others[1].leave();
+      while (room.state.players.has(leaverId)) { await room.waitForNextTimestep(); }
+
+      assert.strictEqual(room.state.players.size, 4);
+      await waitForClientState(others[0], () => !others[0].state.players.has(leaverId));
+    });
+
+    it("transfers host to the next player when the host leaves, who can then start", async () => {
+      const { hostClient, room, code, others } = await fullLobby();
+      const hostId = hostClient.sessionId;
+
+      await hostClient.leave();
+      while (room.state.players.has(hostId)) { await room.waitForNextTimestep(); }
+
+      assert.strictEqual(room.state.hostId, others[0].sessionId, "longest-connected remaining player");
+      await waitForClientState(others[1], () => others[1].state.hostId === others[0].sessionId);
+
+      const [refill] = await joinLobby(code, 1);
+      await readyUp(room, [...others, refill]);
+      await sendAndWait(room, others[0], "startGame");
+      assert.strictEqual(room.state.phase, "starting");
     });
   });
 });

@@ -47,6 +47,12 @@ export const Player = schema({
   // shot, clamped at 0. Nothing happens at 0 yet (no death/respawn).
   maxHealth: t.number().default(PLAYER_MAX_HEALTH),
   health: t.number().default(PLAYER_MAX_HEALTH),
+
+  // Lobby: set only by the sender's own "ready" message, only in the lobby.
+  ready: t.boolean().default(false),
+
+  // 1-based join order, for the lobby's "Player N" label.
+  playerNumber: t.int8().default(0),
 });
 export type Player = SchemaType<typeof Player>;
 
@@ -99,7 +105,14 @@ export const MyRoomState = schema({
   guns: t.map(Gun),
 
   // Server-owned match phase — see shared/matchPhase.ts. Clients only read it.
-  phase: t.string<MatchPhase>().default(""),
+  phase: t.string<MatchPhase>().default("lobby"),
+
+  // Share code for this room; identical to the Colyseus roomId, so
+  // `client.joinById(code)` is the whole join-by-code mechanism.
+  roomCode: t.string().default(""),
+
+  // Session id of the lobby host (first joiner; passed on if they leave).
+  hostId: t.string().default(""),
 
   // Informational countdown for the HUD, whole seconds, updated only when
   // it changes. The server's own ms timer (MyRoom) is what ends preparation.

@@ -1,5 +1,6 @@
 import Phaser from "phaser";
-import { GameScene } from "./scenes/GameScene";
+import type { Room } from "@colyseus/sdk";
+import { GameScene, ROOM_REGISTRY_KEY } from "./scenes/GameScene";
 
 const config: Phaser.Types.Core.GameConfig = {
     type: Phaser.AUTO,
@@ -32,6 +33,12 @@ const config: Phaser.Types.Core.GameConfig = {
     },
 };
 
-export function createGame() {
-    return new Phaser.Game(config);
+export function createGame(room: Room) {
+    return new Phaser.Game({
+        ...config,
+        callbacks: {
+            // Before any scene's create(), so GameScene always finds the room.
+            preBoot: (game) => game.registry.set(ROOM_REGISTRY_KEY, room),
+        },
+    });
 }

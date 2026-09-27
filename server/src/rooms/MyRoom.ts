@@ -1,4 +1,4 @@
-import { Room, Client, CloseCode, type StepContext } from "colyseus";
+import { Room, Client, CloseCode, matchMaker, type StepContext } from "colyseus";
 import { MyRoomState, Player, MoveInput, Gun } from "./schema/MyRoomState.js";
 import { stepEntity } from "../shared/movement.js";
 import { stepGunFiring } from "../shared/gunFiring.js";
@@ -12,9 +12,14 @@ import {
 } from "../shared/constants.js";
 import { pickGhost } from "../shared/roles.js";
 import { stepMatchPhase } from "../shared/matchPhase.js";
+import { generateRoomCode } from "../shared/roomCode.js";
 
 interface ToggleDoorMessage {
   roomIndex?: number;
+}
+
+interface ReadyMessage {
+  ready?: boolean;
 }
 
 interface BuildMessage {
@@ -26,8 +31,7 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
   maxClients = MAX_PLAYERS;
   state = new MyRoomState();
 
-  // Set once, when the room first reaches MAX_PLAYERS (the stand-in for
-  // "match start" until the lobby exists). Roles never re-roll after that.
+  // Set once by beginMatch(); roles never re-roll after that.
   private rolesAssigned = false;
 
   // Server-only ms left in preparation; state.preparationSecondsLeft is
@@ -62,6 +66,35 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
   messages = {
     // movement arrives through the input buffer above — register handlers here
     // only for things that are not inputs (chat, emotes, …).
+
+    /** Sets the SENDER's own ready flag; there is no way to name another player. */
+    ready: (client: Client, message: ReadyMessage) => {
+      if (this.state.phase !== "lobby") { return; }
+
+      const player = this.state.players.get(client.sessionId);
+      if (!player) { return; }
+      if (typeof message?.ready !== "boolean") { return; }
+
+      player.ready = message.ready;
+    },
+
+    /**
+     * Host-only. Accepted only in the lobby with exactly MAX_PLAYERS
+     * players, all ready. On success the room locks and moves to
+     * "starting"; role assignment + preparation are wired to this in 10B.
+     */
+    startGame: (client: Client) => {
+      if (this.state.phase !== "lobby") { return; }
+      if (client.sessionId !== this.state.hostId) { return; }
+      if (this.state.players.size !== MAX_PLAYERS) { return; }
+
+      for (const player of this.state.players.values()) {
+        if (!player.ready) { return; }
+      }
+
+      this.state.phase = "starting";
+      this.lock();
+    },
 
     /**
      * The client only ever REQUESTS a toggle for a specific room — it never
@@ -200,7 +233,13 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
     },
   };
 
-  onCreate(options: any) {
+  async onCreate(options: any) {
+    // The share code IS the roomId (settable only here), so joining by
+    // code is just `client.joinById(code)` — no separate lookup table.
+    const code = await this.generateUniqueRoomCode();
+    this.roomId = code;
+    this.state.roomCode = code;
+
     // Four independent doors, one per ROOM_POSITIONS entry, all starting
     // closed and unlocked.
     this.state.doorsOpen.push(false, false, false, false);
@@ -215,7 +254,24 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
     this.setFixedTimestep((ctx) => this.step(ctx), TICK_RATE);
   }
 
+  private async generateUniqueRoomCode(): Promise<string> {
+    // 31^5 ≈ 28.6M codes; a collision among live rooms is very unlikely,
+    // but checked anyway since there's no database to rely on.
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const code = generateRoomCode();
+      const existing = await matchMaker.query({ roomId: code });
+      if (existing.length === 0) { return code; }
+    }
+    throw new Error("could not allocate a unique room code");
+  }
+
   onJoin(client: Client, options: any) {
+    // Belt and braces with this.lock() in startGame: no new seats once
+    // the lobby has closed.
+    if (this.state.phase !== "lobby") {
+      throw new Error("match already started");
+    }
+
     console.log(client.sessionId, "joined!");
 
     // Deterministic spawn in the 2x2 open plaza at the arena center — no
@@ -233,19 +289,23 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
       vy: 0,
       roomIndex: -1,
       sleeping: false,
+      ready: false,
+      playerNumber: this.joinCount,
     }));
 
-    if (!this.rolesAssigned && this.state.players.size === MAX_PLAYERS) {
-      this.assignRoles();
+    if (this.state.hostId === "") {
+      this.state.hostId = client.sessionId;
     }
   }
 
   /**
    * Exactly one Ghost, chosen server-side; everyone else stays a Defender
    * (the schema default). The Ghost moves to its own spawn outside every
-   * room; Defenders keep wherever they are. Runs once per room.
+   * room; Defenders keep wherever they are; preparation begins. Runs once
+   * per room. Not yet called by startGame — that connection is 10B.
    */
-  private assignRoles() {
+  beginMatch() {
+    if (this.rolesAssigned) { return; }
     this.rolesAssigned = true;
 
     const ghostId = pickGhost([...this.state.players.keys()], this.random);
@@ -301,6 +361,13 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
     console.log(client.sessionId, "left!", code);
     this.state.players.delete(client.sessionId);
     this.coinAccumulatorsMs.delete(client.sessionId);
+
+    // Hand host to the longest-connected remaining player (map order is
+    // join order), so the lobby can still be started.
+    if (this.state.hostId === client.sessionId) {
+      const next = this.state.players.keys().next();
+      this.state.hostId = next.done ? "" : next.value;
+    }
   }
 
   onDispose() {
