@@ -1,14 +1,20 @@
 import { Room, Client, CloseCode, type StepContext } from "colyseus";
-import { MyRoomState, Player, MoveInput } from "./schema/MyRoomState.js";
+import { MyRoomState, Player, MoveInput, Gun } from "./schema/MyRoomState.js";
 import { stepEntity } from "../shared/movement.js";
+import { stepGunFiring } from "../shared/gunFiring.js";
 import {
   TICK_RATE, SPAWN_TILES, getSpawnPixel,
   ROOM_POSITIONS, getRoomDoorPixel, DOOR_INTERACT_RADIUS,
   getRoomBedPixel, getRoomIndexAtPosition, BED_INTERACT_RADIUS,
+  BUILD_TILES_PER_ROOM, GUN_COST, COIN_INTERVAL_MS, getRoomBuildTilePixel, GUN_RANGE,
 } from "../shared/constants.js";
 
 interface ToggleDoorMessage {
   roomIndex?: number;
+}
+
+interface BuildMessage {
+  tileIndex?: number;
 }
 
 export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
@@ -29,6 +35,16 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
 
   private joinCount = 0;
 
+  private nextGunId = 1;
+
+  // Server-only remaining cooldown per gun id — see shared/gunFiring.ts.
+  private gunCooldownsMs = new Map<string, number>();
+
+  // Per-session accrued sleep time in ms, not yet converted into a whole
+  // coin — a plain map alongside `inputs` rather than schema state, since
+  // it's bookkeeping for step(), not something any client needs to read.
+  private coinAccumulatorsMs = new Map<string, number>();
+
   messages = {
     // movement arrives through the input buffer above — register handlers here
     // only for things that are not inputs (chat, emotes, …).
@@ -36,10 +52,11 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
     /**
      * The client only ever REQUESTS a toggle for a specific room — it never
      * sets doorsOpen itself and never supplies a door position. Validated
-     * here: roomIndex must be a real room, the player must exist, and the
+     * here: roomIndex must be a real room, the player must exist, the
      * player's own authoritative server-side position (never a
-     * client-supplied one) must be close enough to THAT room's door. Only
-     * that one room's door state changes.
+     * client-supplied one) must be close enough to THAT room's door, and
+     * the room must not be locked (a sleeping defender's room — see
+     * toggleSleep below). Only that one room's door state changes.
      */
     toggleDoor: (client: Client, message: ToggleDoorMessage) => {
       const player = this.state.players.get(client.sessionId);
@@ -55,6 +72,8 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
       ) {
         return;
       }
+
+      if (this.state.doorsLocked[roomIndex]) { return; }
 
       const door = getRoomDoorPixel(ROOM_POSITIONS[roomIndex]);
       const distance = Math.hypot(player.x - door.x, player.y - door.y);
@@ -76,9 +95,16 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
       if (!player) { return; }
 
       // Waking up never needs a proximity check — keep the current
-      // authoritative position, just resume movement.
+      // authoritative position, just resume movement. The room's door
+      // stays closed but is no longer locked: a defender can now approach
+      // and open it normally (it does not auto-open on wake).
       if (player.sleeping) {
         player.sleeping = false;
+
+        if (player.roomIndex !== -1) {
+          this.state.doorsLocked[player.roomIndex] = false;
+        }
+
         return;
       }
 
@@ -103,12 +129,72 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
       player.vy = 0;
       player.roomIndex = roomIndex;
       player.sleeping = true;
+
+      // PLAYER SLEEPS -> ROOM BECOMES OCCUPIED -> DOOR CLOSES -> DOOR LOCKS.
+      this.state.doorsOpen[roomIndex] = false;
+      this.state.doorsLocked[roomIndex] = true;
+    },
+
+    /**
+     * The client only ever REQUESTS a build at a `tileIndex` inside ITS OWN
+     * current room — it never names a room. The server derives the room
+     * from the player's own authoritative `roomIndex` (never a
+     * client-supplied one), so a modified client cannot build into a room
+     * it doesn't occupy just by naming a different index. Coins are the
+     * server's own balance, never a client-claimed one (see Player.coins).
+     */
+    build: (client: Client, message: BuildMessage) => {
+      const player = this.state.players.get(client.sessionId);
+      if (!player) { return; }
+
+      // Only the sleeping defender of a room may build in it.
+      if (!player.sleeping) { return; }
+      if (player.roomIndex < 0) { return; }
+
+      const tileIndex = message?.tileIndex;
+
+      if (
+        typeof tileIndex !== "number" ||
+        !Number.isInteger(tileIndex) ||
+        tileIndex < 0 ||
+        tileIndex >= BUILD_TILES_PER_ROOM
+      ) {
+        return;
+      }
+
+      const globalTileIndex = player.roomIndex * BUILD_TILES_PER_ROOM + tileIndex;
+
+      if (this.state.buildTilesOccupied[globalTileIndex]) { return; }
+      if (player.coins < GUN_COST) { return; }
+
+      player.coins -= GUN_COST;
+      this.state.buildTilesOccupied[globalTileIndex] = true;
+
+      const id = `gun-${this.nextGunId++}`;
+      const position = getRoomBuildTilePixel(ROOM_POSITIONS[player.roomIndex], tileIndex);
+
+      this.state.guns.set(id, new Gun({
+        id,
+        roomIndex: player.roomIndex,
+        tileIndex,
+        x: position.x,
+        y: position.y,
+        type: "basic",
+      }));
     },
   };
 
   onCreate(options: any) {
-    // Four independent doors, one per ROOM_POSITIONS entry, all starting closed.
+    // Four independent doors, one per ROOM_POSITIONS entry, all starting
+    // closed and unlocked.
     this.state.doorsOpen.push(false, false, false, false);
+    this.state.doorsLocked.push(false, false, false, false);
+
+    // One occupancy flag per build-tile slot across all four rooms, all
+    // starting empty — see MyRoomState.buildTilesOccupied.
+    for (let i = 0; i < BUILD_TILES_PER_ROOM * ROOM_POSITIONS.length; i++) {
+      this.state.buildTilesOccupied.push(false);
+    }
 
     this.setFixedTimestep((ctx) => this.step(ctx), TICK_RATE);
   }
@@ -137,6 +223,7 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
   onLeave(client: Client, code: CloseCode) {
     console.log(client.sessionId, "left!", code);
     this.state.players.delete(client.sessionId);
+    this.coinAccumulatorsMs.delete(client.sessionId);
   }
 
   onDispose() {
@@ -168,6 +255,66 @@ export class MyRoom extends Room<{ state: MyRoomState, input: MoveInput }> {
       }
 
       player.roomIndex = getRoomIndexAtPosition(player.x, player.y);
+
+      // One coin per COIN_INTERVAL_MS of sleep — the same rate the coin
+      // display used to accrue purely client-side; only the authority
+      // moved, not the economy. Accumulator resets whenever the player
+      // isn't sleeping, so a wake/sleep cycle never carries over a
+      // fractional head start.
+      if (player.sleeping) {
+        const accumulatedMs = (this.coinAccumulatorsMs.get(sessionId) ?? 0) + ctx.dt * 1000;
+        const earned = Math.floor(accumulatedMs / COIN_INTERVAL_MS);
+
+        if (earned > 0) {
+          player.coins += earned;
+          this.coinAccumulatorsMs.set(sessionId, accumulatedMs - earned * COIN_INTERVAL_MS);
+        } else {
+          this.coinAccumulatorsMs.set(sessionId, accumulatedMs);
+        }
+      } else {
+        this.coinAccumulatorsMs.set(sessionId, 0);
+      }
+    }
+
+    this.updateGunTargets();
+
+    stepGunFiring(
+      this.state.guns.values(),
+      (sessionId) => this.state.players.has(sessionId),
+      this.gunCooldownsMs,
+      ctx.dt * 1000,
+    );
+  }
+
+  /**
+   * Runs after movement so targets reflect this tick's positions. Pure
+   * Euclidean distance on server coordinates — no walls, doors, rooms or
+   * line of sight. A Ghost that has left is simply absent from `players`,
+   * so every gun clears on the next tick.
+   */
+  private updateGunTargets() {
+    let ghostId = "";
+    let ghost: Player | undefined;
+
+    for (const [sessionId, player] of this.state.players) {
+      if (player.role === "ghost") {
+        ghostId = sessionId;
+        ghost = player;
+        break;
+      }
+    }
+
+    for (const gun of this.state.guns.values()) {
+      if (!ghost) {
+        gun.targetId = "";
+        continue;
+      }
+
+      const dx = ghost.x - gun.x;
+      const dy = ghost.y - gun.y;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+
+      gun.targetId = distance <= GUN_RANGE ? ghostId : "";
     }
   }
 

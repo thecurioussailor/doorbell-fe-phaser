@@ -119,6 +119,56 @@ export function getRoomBedPixel(room: { tileX: number; tileY: number }): { x: nu
 }
 
 /**
+ * Local (column, row) of every build-tile slot inside one room's 8x5
+ * interior, in the exact row-major order GameScene lays out its BuildTile
+ * objects (client-side duplicate, kept in sync by convention like the rest
+ * of this file) — skipping the bed's own tile. A tile's position in this
+ * array IS its `tileIndex`, the identifier a "build" message names; this
+ * is the one place that ordering is defined; every consumer must derive
+ * from this array rather than re-deriving its own.
+ */
+export const ROOM_BUILD_TILES: ReadonlyArray<{ column: number; row: number }> = (() => {
+  const tiles: { column: number; row: number }[] = [];
+
+  for (let row = 1; row < ROOM_HEIGHT_TILES - 1; row++) {
+    for (let column = 1; column < ROOM_WIDTH_TILES - 1; column++) {
+      if (column === ROOM_BED_TILE.column && row === ROOM_BED_TILE.row) { continue; }
+      tiles.push({ column, row });
+    }
+  }
+
+  return tiles;
+})();
+
+/** Number of build-tile slots per room (8x5 interior minus the bed tile = 39). */
+export const BUILD_TILES_PER_ROOM = ROOM_BUILD_TILES.length;
+
+/** A room's build tile, as a pixel centerpoint, by its `tileIndex` into ROOM_BUILD_TILES. */
+export function getRoomBuildTilePixel(room: { tileX: number; tileY: number }, tileIndex: number): { x: number; y: number } {
+  const tile = ROOM_BUILD_TILES[tileIndex];
+  const origin = getRoomPixelPosition(room);
+  return {
+    x: origin.x + tile.column * TILE_SIZE + TILE_SIZE / 2,
+    y: origin.y + tile.row * TILE_SIZE + TILE_SIZE / 2,
+  };
+}
+
+/** Coin cost of one gun — unchanged from the previous (client-only) economy. */
+export const GUN_COST = 50;
+
+/**
+ * Max Euclidean distance (px) at which a gun targets the Ghost. Pure
+ * distance — walls, doors and rooms deliberately do not block targeting.
+ */
+export const GUN_RANGE = 180;
+
+/** Minimum time between two shots from the same gun. */
+export const GUN_FIRE_RATE_MS = 1000;
+
+/** How often a sleeping player earns one coin — unchanged from the previous (client-only) economy. */
+export const COIN_INTERVAL_MS = 1000;
+
+/**
  * Which room (0-3) a pixel position lies inside, or -1 if it's outside all
  * four — the server's one source of truth for room membership, derived
  * from the same ROOM_POSITIONS/ROOM_WIDTH/ROOM_HEIGHT every other room

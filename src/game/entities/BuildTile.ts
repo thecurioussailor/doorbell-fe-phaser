@@ -6,14 +6,27 @@ export class BuildTile extends Phaser.GameObjects.Container {
 
     public isOccupied = false;
 
+    // Which room this slot belongs to and its index within that room's
+    // build tiles — mirrors server/src/shared/constants.ts's
+    // ROOM_BUILD_TILES ordering exactly, since a "build" request names a
+    // tile only by this tileIndex (the server derives the room from the
+    // player's own authoritative roomIndex, never from this).
+    public readonly roomIndex: number;
+    public readonly tileIndex: number;
+
     constructor(
         scene: Phaser.Scene,
         x: number,
         y: number,
         size: number,
+        roomIndex: number,
+        tileIndex: number,
         onClick: (tile: BuildTile) => void
     ) {
         super(scene, x, y);
+
+        this.roomIndex = roomIndex;
+        this.tileIndex = tileIndex;
 
         scene.add.existing(this);
 

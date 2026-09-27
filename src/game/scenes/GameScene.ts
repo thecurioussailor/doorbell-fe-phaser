@@ -22,18 +22,33 @@ export class GameScene extends Phaser.Scene {
     private interactText!: Phaser.GameObjects.Text;
 
     private buildTiles: BuildTile[] = [];
-    private guns: Gun[] = [];
+    // Flat lookup by the same global index the server uses
+    // (roomIndex * buildTilesPerRoom + tileIndex) — see MyRoomState.buildTilesOccupied.
+    private buildTilesByGlobalIndex: BuildTile[] = [];
+    // Visuals for MyRoomState.guns, keyed by the server's gun id.
+    private gunsById = new Map<string, Gun>();
+
+    // Authoritative room the local player currently occupies, mirrored
+    // from the server exactly like `isSleeping` below — build indicators
+    // are computed from this + isSleeping, never decided locally.
+    private localRoomIndex = -1;
 
     // Cache of each room's synchronized door state, indexed exactly like
     // MyRoomState.doorsOpen / server ROOM_POSITIONS / this.roomPositions.
     private doorsOpen: boolean[] = [];
+    // Parallel to doorsOpen — true while that room's sleeping defender has
+    // it locked (see MyRoomState.doorsLocked).
+    private doorsLocked: boolean[] = [];
     private doorBodies: Phaser.Physics.Arcade.StaticBody[] = [];
     private doorGraphics: Phaser.GameObjects.Graphics[] = [];
     private doorPositions: PixelPosition[] = [];
 
     private isSleeping = false;
-    private coins = 0;
-    private coinAccumulator = 0;
+
+    // Free-look camera panning, enabled only while sleeping (see
+    // applySleepingState()). Client-side only — never synchronized, and
+    // never moves the player itself.
+    private isDraggingCamera = false;
 
     private coinsText!: Phaser.GameObjects.Text;
     private sleepingText!: Phaser.GameObjects.Text;
@@ -101,6 +116,43 @@ export class GameScene extends Phaser.Scene {
                     this.setDoorVisual(roomIndex, isOpen);
                 });
 
+                // Same pattern as doorsOpen above, kept as its own parallel
+                // array/listener rather than folded into setDoorVisual —
+                // open/closed and locked/unlocked can each change on their
+                // own (e.g. waking unlocks without opening the door).
+                $(room.state).doorsLocked.onAdd((isLocked: boolean, roomIndex: number) => {
+                    this.setDoorLockVisual(roomIndex, isLocked);
+                }, true);
+
+                $(room.state).doorsLocked.onChange((isLocked: boolean, roomIndex: number) => {
+                    this.setDoorLockVisual(roomIndex, isLocked);
+                });
+
+                // The server owns occupancy for every build-tile slot
+                // across all four rooms, keyed by the same global index
+                // BuildTile uses (see buildTilesByGlobalIndex). This only
+                // drives the tiles' own "+" state; guns render from
+                // state.guns below.
+                $(room.state).buildTilesOccupied.onAdd((isOccupied: boolean, globalIndex: number) => {
+                    this.setBuildTileOccupied(globalIndex, isOccupied);
+                }, true);
+
+                $(room.state).buildTilesOccupied.onChange((isOccupied: boolean, globalIndex: number) => {
+                    this.setBuildTileOccupied(globalIndex, isOccupied);
+                });
+
+                // Every gun is public: all clients render every entry at
+                // the server-decided x/y, regardless of whose room it's in.
+                $(room.state).guns.onAdd((gunState, gunId: string) => {
+                    if (this.gunsById.has(gunId)) { return; }
+                    this.gunsById.set(gunId, new Gun(this, gunState.x, gunState.y));
+                }, true);
+
+                $(room.state).guns.onRemove((_gunState, gunId: string) => {
+                    this.gunsById.get(gunId)?.destroy();
+                    this.gunsById.delete(gunId);
+                });
+
                 $(room.state).players.onAdd((remotePlayerState, sessionId) => {
                     // The server also creates a state entry for us. The local
                     // player is already represented by the keyboard-reading
@@ -119,6 +171,20 @@ export class GameScene extends Phaser.Scene {
                         // right away for a client joining mid-sleep.
                         $(remotePlayerState).listen("sleeping", (isSleeping: boolean) => {
                             this.applySleepingState(isSleeping);
+                        }, true);
+
+                        // The server owns room membership too — build
+                        // indicators are gated on this + sleeping together
+                        // (see updateBuildVisibility()).
+                        $(remotePlayerState).listen("roomIndex", (roomIndex: number) => {
+                            this.localRoomIndex = roomIndex;
+                            this.updateBuildVisibility();
+                        }, true);
+
+                        // The server owns the coin balance — this label is
+                        // purely a reflection of it, never a local count.
+                        $(remotePlayerState).listen("coins", (coins: number) => {
+                            this.coinsText.setText(`COINS  ${coins}`);
                         }, true);
 
                         return;
@@ -261,25 +327,51 @@ export class GameScene extends Phaser.Scene {
         this.input.keyboard!.on("keydown-ESC", () => {
             this.closeBuildMenu();
         });
+
+        this.setupCameraDrag();
     }
 
-    update(_time: number, delta: number) {
+    // Free-look panning for a sleeping defender — the player stays locked
+    // to the bed (movement is already disabled server- and client-side
+    // while sleeping); only the camera moves, and only client-side.
+    // Phaser's generic pointer events (not a game-object's own
+    // "pointerdown") so this works the same for mouse and touch.
+    private setupCameraDrag() {
+        this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
+            if (!this.isSleeping) { return; }
+
+            // Let clicks on build tiles / the build menu / any other
+            // interactive UI reach their own handlers instead of starting
+            // a drag — only bare map space begins a pan.
+            if (this.input.hitTestPointer(pointer).length > 0) { return; }
+
+            this.isDraggingCamera = true;
+        });
+
+        this.input.on("pointermove", (pointer: Phaser.Input.Pointer) => {
+            if (!this.isDraggingCamera || !pointer.isDown) { return; }
+
+            const camera = this.cameras.main;
+
+            // Dragging right reveals the world's left side — the camera
+            // moves opposite the drag, like grabbing and pulling the map.
+            // Phaser's bounds system (setBounds() above) clamps this
+            // automatically every frame; no manual clamping needed here.
+            camera.scrollX -= (pointer.x - pointer.prevPosition.x) / camera.zoom;
+            camera.scrollY -= (pointer.y - pointer.prevPosition.y) / camera.zoom;
+        });
+
+        this.input.on("pointerup", () => {
+            this.isDraggingCamera = false;
+        });
+    }
+
+    update(_time: number, _delta: number) {
         // If the player is sleeping (server-authoritative — see
         // applySleepingState()), don't allow movement.
         if (this.isSleeping) {
-            // Accumulate the time that has passed
-            this.coinAccumulator += delta;
-
-            // 1000 milliseconds = 1 second
-            if (this.coinAccumulator >= 1000) {
-                this.coins += 1;
-
-                this.coinsText.setText(
-                    `COINS  ${this.coins}`
-                );
-
-                this.coinAccumulator -= 1000;
-            }
+            // Coins are now earned server-side (see the "coins" listener
+            // in create()) — this branch only re-anchors the label.
 
             // Re-anchored every frame (rather than once, on the sleeping
             // transition) so it can't show stale if the position sync and
@@ -315,9 +407,11 @@ export class GameScene extends Phaser.Scene {
             this.interactText.setVisible(true);
 
             this.interactText.setText(
-                this.doorsOpen[nearbyDoor.roomIndex]
-                    ? "E  CLOSE DOOR"
-                    : "E  OPEN DOOR"
+                this.doorsLocked[nearbyDoor.roomIndex]
+                    ? "LOCKED"
+                    : this.doorsOpen[nearbyDoor.roomIndex]
+                        ? "E  CLOSE DOOR"
+                        : "E  OPEN DOOR"
             );
 
             this.interactText.setPosition(
@@ -405,10 +499,17 @@ export class GameScene extends Phaser.Scene {
         }
     }
 
+    // Number of build-tile slots per room (8x5 interior minus the bed
+    // tile) — mirrors server/src/shared/constants.ts's
+    // ROOM_BUILD_TILES.length exactly; both are derived from the same
+    // roomWidthTiles/roomHeightTiles/roomBedTile shape.
+    private readonly buildTilesPerRoom =
+        (this.roomHeightTiles - 2) * (this.roomWidthTiles - 2) - 1;
+
     // Draws all four rooms from the shared roomPositions layout.
     private createFourRooms() {
-        this.roomPositions.forEach((room) => {
-            this.createRoomShell(room);
+        this.roomPositions.forEach((room, roomIndex) => {
+            this.createRoomShell(room, roomIndex);
         });
     }
 
@@ -418,7 +519,7 @@ export class GameScene extends Phaser.Scene {
     // (Milestone 6B is where room-wall collision returns); the door alone
     // keeps a physics body, purely for its own open/close toggle, exactly
     // like the original single room.
-    private createRoomShell(room: TilePosition) {
+    private createRoomShell(room: TilePosition, roomIndex: number) {
         const graphics = this.add.graphics();
 
         // Floor grid across the room's full span — walls are painted over
@@ -459,7 +560,13 @@ export class GameScene extends Phaser.Scene {
         const bedPixel = this.getRoomBedPixel(room);
         this.beds.push(new Bed(this, bedPixel.x, bedPixel.y));
 
-        // Build tiles across the interior, minus the bed's own tile.
+        // Build tiles across the interior, minus the bed's own tile. The
+        // row-major order here (row outer, column inner, bed tile skipped)
+        // IS the tileIndex sequence — it must match
+        // server/src/shared/constants.ts's ROOM_BUILD_TILES exactly, since
+        // a "build" request names a tile only by this index.
+        let tileIndex = 0;
+
         for (let row = 1; row < this.roomHeightTiles - 1; row++) {
             for (let column = 1; column < this.roomWidthTiles - 1; column++) {
 
@@ -475,12 +582,17 @@ export class GameScene extends Phaser.Scene {
                     x,
                     y,
                     this.tileSize,
+                    roomIndex,
+                    tileIndex,
                     (clickedTile) => {
                         this.openBuildMenu(clickedTile);
                     }
                 );
 
                 this.buildTiles.push(tile);
+                this.buildTilesByGlobalIndex[roomIndex * this.buildTilesPerRoom + tileIndex] = tile;
+
+                tileIndex++;
             }
         }
     }
@@ -506,7 +618,7 @@ export class GameScene extends Phaser.Scene {
         this.doorBodies.push(doorRect.body as Phaser.Physics.Arcade.StaticBody);
     }
 
-    private drawDoorVisual(graphics: Phaser.GameObjects.Graphics, position: PixelPosition, isOpen: boolean) {
+    private drawDoorVisual(graphics: Phaser.GameObjects.Graphics, position: PixelPosition, isOpen: boolean, isLocked: boolean = false) {
         graphics.clear();
 
         const half = this.tileSize / 2;
@@ -521,7 +633,10 @@ export class GameScene extends Phaser.Scene {
             graphics.fillStyle(0x151515, 1);
             graphics.fillRect(position.x - half, position.y - half, this.tileSize, this.tileSize);
 
-            graphics.lineStyle(2, 0xc8a96b, 1);
+            // Closed + locked reuses the same closed-door shape, just with
+            // a red outline instead of gold — a minimal indicator, not a
+            // redesign of the door artwork.
+            graphics.lineStyle(2, isLocked ? 0xd64545 : 0xc8a96b, 1);
             graphics.strokeRect(position.x - half + 3, position.y - half + 3, this.tileSize - 6, this.tileSize - 6);
         }
     }
@@ -593,7 +708,22 @@ export class GameScene extends Phaser.Scene {
 
     private setDoorVisual(roomIndex: number, isOpen: boolean) {
         this.doorsOpen[roomIndex] = isOpen;
+        this.redrawDoor(roomIndex);
+    }
 
+    // Reacts to the server's authoritative buildTilesOccupied flag for one
+    // global tile index — never set locally by a click.
+    private setBuildTileOccupied(globalIndex: number, isOccupied: boolean) {
+        this.buildTilesByGlobalIndex[globalIndex]?.setOccupied(isOccupied);
+        this.updateBuildVisibility();
+    }
+
+    private setDoorLockVisual(roomIndex: number, isLocked: boolean) {
+        this.doorsLocked[roomIndex] = isLocked;
+        this.redrawDoor(roomIndex);
+    }
+
+    private redrawDoor(roomIndex: number) {
         const body = this.doorBodies[roomIndex];
         const graphics = this.doorGraphics[roomIndex];
         const position = this.doorPositions[roomIndex];
@@ -602,8 +732,11 @@ export class GameScene extends Phaser.Scene {
             return;
         }
 
+        const isOpen = this.doorsOpen[roomIndex] ?? false;
+        const isLocked = this.doorsLocked[roomIndex] ?? false;
+
         body.enable = !isOpen;
-        this.drawDoorVisual(graphics, position, isOpen);
+        this.drawDoorVisual(graphics, position, isOpen, isLocked);
     }
 
     // Requests a sleep/wake toggle — does NOT flip isSleeping itself. The
@@ -624,13 +757,16 @@ export class GameScene extends Phaser.Scene {
     private applySleepingState(isSleeping: boolean) {
         this.isSleeping = isSleeping;
 
-        this.buildTiles.forEach((tile) => {
-            tile.setBuildMode(isSleeping);
-        });
+        this.updateBuildVisibility();
 
         this.sleepingText.setVisible(isSleeping);
 
         if (isSleeping) {
+            // Stop following where the camera already is — the sleeping
+            // defender starts looking around from whatever's currently on
+            // screen, not a re-centered view.
+            this.cameras.main.stopFollow();
+
             this.interactText.setVisible(false);
             // Best-effort immediate placement; update() re-anchors this
             // every frame afterward regardless.
@@ -639,8 +775,28 @@ export class GameScene extends Phaser.Scene {
                 this.player.y + 90
             );
         } else {
-            this.coinAccumulator = 0;
+            // Waking: drop any in-progress pan and resume the normal
+            // awake follow behavior exactly as it was originally set up.
+            this.isDraggingCamera = false;
+            this.cameras.main.startFollow(this.player, true, 0.1, 0.1);
         }
+    }
+
+    // Recomputes every build tile's "+" visibility from the two
+    // authoritative values that gate it: the local player must be
+    // sleeping, and the tile must belong to the room they're sleeping in.
+    // Occupied tiles never show "+" regardless (BuildTile.setOccupied
+    // already hides its own plus sign, but skip it here too for clarity).
+    // Called whenever either authoritative value changes, or a tile's own
+    // occupancy changes.
+    private updateBuildVisibility() {
+        this.buildTiles.forEach((tile) => {
+            const shouldShow = this.isSleeping
+                && tile.roomIndex === this.localRoomIndex
+                && !tile.isOccupied;
+
+            tile.setBuildMode(shouldShow);
+        });
     }
 
     private openBuildMenu(tile: BuildTile) {
@@ -737,7 +893,7 @@ export class GameScene extends Phaser.Scene {
 
         gunButton.on("pointerdown", () => {
 
-            this.buildGun(tile);
+            this.requestBuild(tile);
 
         });
 
@@ -754,53 +910,15 @@ export class GameScene extends Phaser.Scene {
         this.buildMenu = undefined;
     }
 
-    private buildGun(tile: BuildTile) {
-        const gunCost = 50;
-
-        // --------------------------------
-        // Check if we have enough coins
-        // --------------------------------
-
-        if (this.coins < gunCost) {
-            console.log("Not enough coins");
-            return;
-        }
-
-        // --------------------------------
-        // Spend coins
-        // --------------------------------
-
-        this.coins -= gunCost;
-
-        this.coinsText.setText(
-            `COINS  ${this.coins}`
-        );
-
-        // --------------------------------
-        // Occupy the tile
-        // --------------------------------
-
-        tile.setOccupied(true);
-
-        // --------------------------------
-        // Create gun on the tile
-        // --------------------------------
-
-        const gun = new Gun(
-            this,
-            tile.x,
-            tile.y
-        );
-
-        this.guns.push(gun);
-
-        // --------------------------------
-        // Close build menu
-        // --------------------------------
-
+    // Sends a build request naming only the tile's index within its own
+    // room — never a room index, a position, or a coin balance. The
+    // server derives the room from the player's own authoritative
+    // roomIndex and validates sleeping/occupancy/coins; the tile's
+    // occupied visual and the Gun itself only ever appear once that
+    // decision comes back through the buildTilesOccupied listener above.
+    private requestBuild(tile: BuildTile) {
+        this.room?.send("build", { tileIndex: tile.tileIndex });
         this.closeBuildMenu();
-
-        console.log("Gun built!");
     }
 
 }
